@@ -1,0 +1,12 @@
+# experiments: very large, data-only
+experiments/
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+*.log
+
+# env
+.env

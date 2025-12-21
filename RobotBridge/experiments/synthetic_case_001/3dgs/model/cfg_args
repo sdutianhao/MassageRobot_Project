@@ -1,0 +1,1 @@
+Namespace(data_device='cuda', depths='', eval=False, images='images', model_path='/home/hsmr/MassageRobot_Project/RobotBridge/experiments/synthetic_case_001/3dgs/model', resolution=-1, sh_degree=3, source_path='/home/hsmr/MassageRobot_Project/RobotBridge/experiments/synthetic_case_001/3dgs/source', train_test_exp=False, white_background=False)

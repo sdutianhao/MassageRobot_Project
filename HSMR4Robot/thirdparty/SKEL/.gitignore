@@ -1,0 +1,5 @@
+output/
+data/
+*.egg-info
+*__pycache__/
+imgui.ini
