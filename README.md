@@ -108,7 +108,7 @@ Pipeline 在 `--use_fixed_data` 模式下，**始终使用同一张固定深度�
 output/20251218_201849_mode1/source_data/depth_obs.npy
 ```
 
-这是一张 **ROI 深度图（单位：米）**，用于：
+这是一张 **ROI 深度图（单位：米）**，在人体模型的指定区域采样2亿深度点并绘制深度图片，用于：
 
 * Stage2 的姿态优化
 * Stage3 的微表面优化
@@ -117,11 +117,19 @@ output/20251218_201849_mode1/source_data/depth_obs.npy
 
 ---
 
+也可以重新生成深度图：
+
+```bash
+cd ~/MassageRobot_Project/RobotBridge && \
+python -m pipeline.pipeline_runner --mode 1 --steps data
+```
+
 ## 4. Pipeline 运行方式（How to Run）
 
 ### 4.1 Stage2：姿态 θ 优化
 
 ```bash
+cd ~/MassageRobot_Project/RobotBridge && \
 python -m pipeline.pipeline_runner \
   --mode 1 \
   --steps stage2 \
@@ -149,6 +157,7 @@ python -m pipeline.pipeline_runner \
 ### 4.2 Stage3：ROI 微表面优化（Micro-Skin）
 
 ```bash
+cd ~/MassageRobot_Project/RobotBridge && \
 python -m pipeline.pipeline_runner \
   --mode 1 \
   --steps stage3 \
