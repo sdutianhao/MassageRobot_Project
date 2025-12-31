@@ -16,6 +16,7 @@ from utils.vis import save_depth_vis
 from utils.ray_likelihood import ray_overlap_nll
 from utils.ply_vis import save_roi_mesh_ellipsoids_ply
 from utils.metrics import mean_vertex_deviation
+from utils.vis_roi import save_overlay_ellipsoids_gt_png
 
 from stage3.gaussian_adapter import GaussianSkinModel
 
@@ -109,9 +110,6 @@ def main():
         v_gt_cam = apply_rigid(v_gt, rot, trans)
         v_start_cam = apply_rigid(v_start, rot, trans)
 
-        if not args.no_report_metrics:
-            roi_dev_start = mean_vertex_deviation(v_start_cam, v_gt_cam, idx=model.roi_v_idx).item()
-
         save_comparison_ply(
             v_start_cam.detach().cpu().numpy(),
             v_gt_cam.detach().cpu().numpy(),
@@ -119,8 +117,15 @@ def main():
             os.path.join(dir_vis_3d, "opt_start.ply"),
         )
 
+        if not args.no_report_metrics:
+            roi_dev_start = mean_vertex_deviation(v_start_cam, v_gt_cam, idx=model.roi_v_idx).item()
+
         c_start_cam = model.ellipsoid_centers_cam(v_start)
         log_s_start = model.ellipsoid_log_scales()
+
+        # Export ALL ROI ellipsoids in visualization
+        vis_all_ell = int(model.roi_faces.shape[0])
+
         save_roi_mesh_ellipsoids_ply(
             v_gt=v_gt_cam,
             v_pred=v_start_cam,
@@ -130,8 +135,23 @@ def main():
             centers_pred=c_start_cam,
             ellipsoid_log_scales=log_s_start,
             out_ply=os.path.join(dir_vis_3d, "roi_START.ply"),
-            max_ellipsoids=350,
+            max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
+        )
+
+        # NEW: 2D overlay (START): ellipsoids + GT human
+        save_overlay_ellipsoids_gt_png(
+            v_gt_cam=v_gt_cam,
+            centers_cam=c_start_cam,
+            ellipsoid_log_scales=log_s_start,
+            K=K,
+            roi_xywh=roi_xywh,
+            roi_wh=roi_wh,
+            out_png=os.path.join(dir_vis, "overlay_ell_gt_start.png"),
+            title="Stage3 START: ellipsoids + GT",
+            max_gt_points=20000,
+            max_ellipsoids=None,
+            ellipsoid_level=1.0,
         )
 
         depth_pred_start = render_gaussian_depth(
@@ -176,16 +196,15 @@ def main():
         optimizer.step()
 
         if (it % 50 == 0) or (it == 1) or (it == int(args.epochs)):
-            print(f"[Stage3][{it:03d}/{int(args.epochs)}] L={loss.item():.5f} (NLL={loss_nll.item():.5f}, disp={loss_disp_reg.item():.5f}, shape={loss_shape_reg.item():.5f}) "
-                  f"[centers={stats['num_centers']} pix={stats['num_pix']} t={stats['num_t']}]")
+            print(
+                f"[Stage3][{it:03d}/{int(args.epochs)}] L={loss.item():.5f} (NLL={loss_nll.item():.5f}, disp={loss_disp_reg.item():.5f}, shape={loss_shape_reg.item():.5f}) "
+                f"[centers={stats['num_centers']} pix={stats['num_pix']} t={stats['num_t']}]"
+            )
 
     # ---- END 可视化 ----
     with torch.no_grad():
         v_end = model().detach()
         v_end_cam = apply_rigid(v_end, rot, trans)
-
-        if not args.no_report_metrics:
-            roi_dev_end = mean_vertex_deviation(v_end_cam, v_gt_cam, idx=model.roi_v_idx).item()
 
         save_comparison_ply(
             v_end_cam.detach().cpu().numpy(),
@@ -201,8 +220,14 @@ def main():
             os.path.join(dir_vis_3d, "opt_delta.ply"),
         )
 
+        if not args.no_report_metrics:
+            roi_dev_end = mean_vertex_deviation(v_end_cam, v_gt_cam, idx=model.roi_v_idx).item()
+
         c_end_cam = model.ellipsoid_centers_cam(v_end)
         log_s_end = model.ellipsoid_log_scales()
+
+        vis_all_ell = int(model.roi_faces.shape[0])
+
         save_roi_mesh_ellipsoids_ply(
             v_gt=v_gt_cam,
             v_pred=v_end_cam,
@@ -212,8 +237,23 @@ def main():
             centers_pred=c_end_cam,
             ellipsoid_log_scales=log_s_end,
             out_ply=os.path.join(dir_vis_3d, "roi_END.ply"),
-            max_ellipsoids=350,
+            max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
+        )
+
+        # NEW: 2D overlay (END): ellipsoids + GT human
+        save_overlay_ellipsoids_gt_png(
+            v_gt_cam=v_gt_cam,
+            centers_cam=c_end_cam,
+            ellipsoid_log_scales=log_s_end,
+            K=K,
+            roi_xywh=roi_xywh,
+            roi_wh=roi_wh,
+            out_png=os.path.join(dir_vis, "overlay_ell_gt_end.png"),
+            title="Stage3 END: ellipsoids + GT",
+            max_gt_points=20000,
+            max_ellipsoids=None,
+            ellipsoid_level=1.0,
         )
 
         depth_pred_end = render_gaussian_depth(
@@ -230,7 +270,6 @@ def main():
     })
 
     print(f"[*] Done. Results -> {args.out_dir}")
-
     if not args.no_report_metrics:
         print(f"[Stage3][ROIMeanDev] start={roi_dev_start:.6f}m end={roi_dev_end:.6f}m")
 

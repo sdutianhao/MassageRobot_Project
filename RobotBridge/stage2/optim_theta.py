@@ -8,9 +8,10 @@ from stage2.skel_adapter import SkelAdapter
 from stage1.camera import axis_angle_to_matrix, project_points
 from stage1.render_depth import render_gaussian_depth
 from utils.vis import save_depth_vis
-from utils.metrics import pa_mpjpe, mean_vertex_deviation
+from utils.metrics import pa_mpjpe
 from utils.ply_vis import save_stage3_style_comparison_ply, save_roi_overlay_ply, save_roi_mesh_ellipsoids_ply
 from utils.ray_likelihood import ray_overlap_nll
+from utils.vis_roi import save_overlay_ellipsoids_gt_png
 
 
 def save_comparison_ply(V_pred, V_gt, Faces, filename):
@@ -101,10 +102,6 @@ def optimize_theta(
     use_aniso = bool(CFG_STAGE2.get("ray_use_anisotropic", True))
     num_t = int(CFG_STAGE2.get("ray_num_t", 5))
 
-    # ---- metrics (mean vertex deviation) ----
-    start_global = float("nan")
-    end_global = float("nan")
-
     with torch.no_grad():
         roi_idx = _roi_idx_from_gt(V_gt_cam, K, roi_xywh)
         roi_n = int(roi_idx.numel())
@@ -112,7 +109,6 @@ def optimize_theta(
 
     with torch.no_grad():
         V0_cam = skel.forward_vertices() @ R.T + t
-        start_global = mean_vertex_deviation(V0_cam, V_gt_cam).item()
         ellipsoid_log_scales = _init_fixed_ellipsoid_log_scales(V0_cam, faces_t, min_s=0.01)
 
     print(f"[Stage2] Start Prob-Ray Optim. iters={iters}, Noise={init_noise_std}")
@@ -148,8 +144,23 @@ def optimize_theta(
             centers_pred=C0,
             ellipsoid_log_scales=ellipsoid_log_scales,
             out_ply=os.path.join(ply_dir, "roi_START.ply"),
-            max_ellipsoids=350,
+            max_ellipsoids=int(C0.shape[0]),
             ellipsoid_level=1
+        )
+
+        # NEW: 2D overlay (START): ellipsoids + GT human (ROI pixel coords)
+        save_overlay_ellipsoids_gt_png(
+            v_gt_cam=V_gt_cam,
+            centers_cam=C0,
+            ellipsoid_log_scales=ellipsoid_log_scales,
+            K=K,
+            roi_xywh=roi_xywh,
+            roi_wh=roi_wh,
+            out_png=os.path.join(vis_dir, "overlay_ell_gt_start.png"),
+            title="Stage2 START: ellipsoids + GT",
+            max_gt_points=20000,
+            max_ellipsoids=max_ell,
+            ellipsoid_level=1.0,
         )
 
     for it in range(iters):
@@ -188,7 +199,6 @@ def optimize_theta(
 
     with torch.no_grad():
         Vend_cam = skel.forward_vertices() @ R.T + t
-        end_global = mean_vertex_deviation(Vend_cam, V_gt_cam).item()
         tri_end = Vend_cam[faces_t]
         Cend = tri_end.mean(dim=1)
 
@@ -224,8 +234,23 @@ def optimize_theta(
             centers_pred=Cend,
             ellipsoid_log_scales=ellipsoid_log_scales,
             out_ply=os.path.join(ply_dir, "roi_END.ply"),
-            max_ellipsoids=350,
+            max_ellipsoids=int(Cend.shape[0]),
             ellipsoid_level=1
+        )
+
+        # NEW: 2D overlay (END): ellipsoids + GT human (ROI pixel coords)
+        save_overlay_ellipsoids_gt_png(
+            v_gt_cam=V_gt_cam,
+            centers_cam=Cend,
+            ellipsoid_log_scales=ellipsoid_log_scales,
+            K=K,
+            roi_xywh=roi_xywh,
+            roi_wh=roi_wh,
+            out_png=os.path.join(vis_dir, "overlay_ell_gt_end.png"),
+            title="Stage2 END: ellipsoids + GT",
+            max_gt_points=20000,
+            max_ellipsoids=max_ell,
+            ellipsoid_level=1.0,
         )
 
     theta_out = {
@@ -233,6 +258,3 @@ def optimize_theta(
         'beta': skel.beta.detach().cpu().numpy()
     }
     np.save(os.path.join(out_dir, "theta_opt.npy"), theta_out)
-
-    if bool(CFG_STAGE2.get("report_metrics", True)):
-        print(f"[Stage2][GlobalMeanDev] start={start_global:.6f}m end={end_global:.6f}m")
