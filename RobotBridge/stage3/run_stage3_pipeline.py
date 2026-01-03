@@ -16,7 +16,7 @@ from stage2.optim_theta import save_comparison_ply
 from utils.vis import save_depth_vis
 from utils.ray_likelihood import ray_overlap_nll
 from utils.gmm_likelihood import gmm_surface_nll
-from utils.ply_vis import save_roi_mesh_ellipsoids_ply, save_roi_pred_ellipsoids_only_ply
+from utils.ply_vis import save_roi_mesh_ellipsoids_ply, save_roi_pred_ellipsoids_only_ply, save_mesh_only_ply, save_roi_pred_mesh_only_ply, save_roi_ellipsoids_only_ply
 from utils.metrics import mean_vertex_deviation
 from utils.vis_roi import save_overlay_ellipsoids_gt_png
 
@@ -61,6 +61,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     dir_vis_3d = os.path.join(args.out_dir, "vis_3d")
     os.makedirs(dir_vis_3d, exist_ok=True)
+    dir_vis_3d_comp = os.path.join(dir_vis_3d, "composite")
+    os.makedirs(dir_vis_3d_comp, exist_ok=True)
     dir_vis = os.path.join(args.out_dir, "vis_process")
     os.makedirs(dir_vis, exist_ok=True)
 
@@ -105,15 +107,20 @@ def main():
     roi_f_idx_override = None
     
     # runtime_vis_gate: 传递给 loss 函数的动态门控值
-    # 如果是 0.0，表示“不进行每轮剔除”，这对 GMM 优化至关重要
+    # 如果是 0.0，表示“不进行每轮剔除”
     runtime_vis_gate = 0.0
 
-    if args.data_term == "gmm":
+    # [Modified] 只要设定了门控，无论是 Ray 还是 GMM，都进行静态筛选
+    # 这样 Ray 也能避开 GaussianSkinModel 内部的 bug，并获得稳定的顶点集
+    should_run_static_selection = (args.data_term == "gmm") or (float(args.vis_depth_gate) > 0.0)
+
+    if should_run_static_selection:
         # 1. 确定初始筛选阈值 (selection_gate)
-        # 如果用户指定了正数，用之；否则默认 0.01m
+        # 如果用户指定了正数，用之；否则默认 0.01m (GMM默认)
         selection_gate = float(args.vis_depth_gate) if float(args.vis_depth_gate) > 0.0 else 0.01
         
-        print(f"[Stage3][GMM] Performing STATIC visibility selection (gate={selection_gate:.4f}m)...")
+        term_label = args.data_term.upper()
+        print(f"[Stage3][{term_label}] Performing STATIC visibility selection (gate={selection_gate:.4f}m)...")
         
         with torch.no_grad():
             rx, ry, rw, rh = [float(x) for x in roi_xywh]
@@ -158,17 +165,17 @@ def main():
             # 随机采样上限
             max_ell = int(args.max_ellipsoids)
             if roi_f_idx_override.numel() > max_ell:
-                print(f"[Stage3][GMM] Subsampling ellipsoids {roi_f_idx_override.numel()} -> {max_ell}")
+                print(f"[Stage3][{term_label}] Subsampling ellipsoids {roi_f_idx_override.numel()} -> {max_ell}")
                 sel = torch.randperm(roi_f_idx_override.numel(), device=device)[:max_ell]
                 roi_f_idx_override = roi_f_idx_override[sel]
 
-        # 【关键】GMM 模式下，静态筛选后，运行时强制关闭动态门控
+        # 【关键】静态筛选后，运行时强制关闭动态门控
         runtime_vis_gate = 0.0
-        print(f"[Stage3][GMM] Fixed Subset: Verts={roi_v_idx_override.numel()}, Faces={roi_f_idx_override.numel()}")
-        print(f"[Stage3][GMM] Runtime dynamic gate DISABLED (set to 0.0).")
+        print(f"[Stage3][{term_label}] Fixed Subset: Verts={roi_v_idx_override.numel()}, Faces={roi_f_idx_override.numel()}")
+        print(f"[Stage3][{term_label}] Runtime dynamic gate DISABLED (set to 0.0).")
 
     else:
-        # Ray 模式：保留用户设定 (如果 args < 0，默认为 0.0)
+        # Ray 模式且没有设置门控（不推荐）
         if float(args.vis_depth_gate) < 0.0:
             runtime_vis_gate = 0.0
         else:
@@ -213,7 +220,7 @@ def main():
             v_start_cam.detach().cpu().numpy(),
             v_gt_cam.detach().cpu().numpy(),
             faces_cpu,
-            os.path.join(dir_vis_3d, "opt_start.ply"),
+            os.path.join(dir_vis_3d_comp, "opt_start.ply"),
         )
 
         if not args.no_report_metrics:
@@ -232,9 +239,32 @@ def main():
             roi_xywh=roi_xywh,
             centers_pred=c_start_cam,
             ellipsoid_log_scales=log_s_start,
-            out_ply=os.path.join(dir_vis_3d, "roi_START.ply"),
+            out_ply=os.path.join(dir_vis_3d_comp, "roi_START.ply"),
             max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
+        )
+        # ---- EXTRA PLY (START) ----
+        save_roi_pred_mesh_only_ply(
+            v_pred=v_start_cam,
+            faces=faces_gpu,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_pred_START.ply"),
+        )
+        save_roi_ellipsoids_only_ply(
+            centers_pred=c_start_cam,
+            ellipsoid_log_scales=log_s_start,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_ell_START.ply"),
+            max_ellipsoids=vis_all_ell,
+            ellipsoid_level=1,
+        )
+        save_mesh_only_ply(
+            v=v_gt_cam,
+            faces=faces_gpu,
+            out_ply=os.path.join(dir_vis_3d, "human_GT.ply"),
+            rgb=(0, 0, 255),
         )
 
         save_overlay_ellipsoids_gt_png(
@@ -506,14 +536,14 @@ def main():
             v_end_cam.detach().cpu().numpy(),
             v_gt_cam.detach().cpu().numpy(),
             faces_cpu,
-            os.path.join(dir_vis_3d, "opt_end.ply"),
+            os.path.join(dir_vis_3d_comp, "opt_end.ply"),
         )
 
         save_comparison_ply(
             v_end_cam.detach().cpu().numpy(),
             v_start_cam.detach().cpu().numpy(),
             faces_cpu,
-            os.path.join(dir_vis_3d, "opt_delta.ply"),
+            os.path.join(dir_vis_3d_comp, "opt_delta.ply"),
         )
 
         if not args.no_report_metrics:
@@ -533,7 +563,24 @@ def main():
             roi_xywh=roi_xywh,
             centers_pred=c_end_cam,
             ellipsoid_log_scales=log_s_end,
-            out_ply=os.path.join(dir_vis_3d, "roi_END.ply"),
+            out_ply=os.path.join(dir_vis_3d_comp, "roi_END.ply"),
+            max_ellipsoids=vis_all_ell,
+            ellipsoid_level=1,
+        )
+        # ---- EXTRA PLY (END) ----
+        save_roi_pred_mesh_only_ply(
+            v_pred=v_end_cam,
+            faces=faces_gpu,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_pred_END.ply"),
+        )
+        save_roi_ellipsoids_only_ply(
+            centers_pred=c_end_cam,
+            ellipsoid_log_scales=log_s_end,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_ell_END.ply"),
             max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
         )
@@ -546,7 +593,7 @@ def main():
             roi_xywh=roi_xywh,
             centers_pred=c_end_cam,
             ellipsoid_log_scales=log_s_end,
-            out_ply=os.path.join(dir_vis_3d, "roi_pred_only_END.ply"),
+            out_ply=os.path.join(dir_vis_3d_comp, "roi_pred_only_END.ply"),
             max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
         )

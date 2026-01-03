@@ -31,10 +31,14 @@ CAMERA_NPZ = os.path.join(PROJECT_ROOT, "experiments/synthetic_case_001/camera/c
 
 # ================= Synthetic GT (Simulation) =================
 # 仿真生成深度图时使用的真值
-DEPTH_SYN_ROT_GT = np.array([0.1, 0.0, 0.0], dtype=np.float32)
-DEPTH_SYN_TRANS_GT = np.array([0.0, 0.0, 0.5], dtype=np.float32)
+# 后背
+DEPTH_SYN_ROT_GT = np.array([0.0, 0.8, 0.0], dtype=np.float32)
+DEPTH_SYN_TRANS_GT = np.array([0.0, 0.35, 0.45], dtype=np.float32)
+
+# DEPTH_SYN_ROT_GT = np.array([0.0, 3.75, 0.0], dtype=np.float32)
+# DEPTH_SYN_TRANS_GT = np.array([0.0, -0.25, 0.80], dtype=np.float32)
 
 # ================= Stage 1 Init =================
 # 刚体对齐的初始猜测
-STAGE1_INIT_ROT = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+STAGE1_INIT_ROT = np.array([0.1, 0.0, 0.0], dtype=np.float32)
 STAGE1_INIT_TRANS = np.array([0.0, 0.0, 0.4], dtype=np.float32)

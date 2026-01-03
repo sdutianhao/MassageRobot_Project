@@ -378,3 +378,133 @@ def save_roi_pred_ellipsoids_only_ply(
         for i in range(F_all.shape[0]):
             fh.write(f"3 {F_all[i,0]} {F_all[i,1]} {F_all[i,2]}\n")
     print(f"[Viz] Saved Pred-Only ROI: {out_ply}")
+
+def save_mesh_only_ply(v: torch.Tensor, faces: torch.Tensor, out_ply: str, rgb=(0, 255, 0)):
+    """
+    保存单个 mesh（全 mesh，不做 ROI 过滤）。
+    """
+    os.makedirs(os.path.dirname(out_ply), exist_ok=True)
+    V = v.detach().cpu().numpy()
+    F = faces.detach().cpu().numpy().astype(np.int32)
+    r, g, b = rgb
+
+    with open(out_ply, "w") as fh:
+        fh.write("ply\nformat ascii 1.0\n")
+        fh.write(f"element vertex {V.shape[0]}\n")
+        fh.write("property float x\nproperty float y\nproperty float z\n")
+        fh.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        fh.write(f"element face {F.shape[0]}\n")
+        fh.write("property list uchar int vertex_indices\n")
+        fh.write("end_header\n")
+        for i in range(V.shape[0]):
+            fh.write(f"{V[i,0]:.6f} {V[i,1]:.6f} {V[i,2]:.6f} {int(r)} {int(g)} {int(b)}\n")
+        for i in range(F.shape[0]):
+            fh.write(f"3 {F[i,0]} {F[i,1]} {F[i,2]}\n")
+
+    print(f"[Viz] Saved: {out_ply}")
+
+
+def save_roi_pred_mesh_only_ply(
+    v_pred: torch.Tensor,
+    faces: torch.Tensor,
+    K: torch.Tensor,
+    roi_xywh,
+    out_ply: str,
+    rgb=(0, 255, 0),
+):
+    """
+    仅保存 ROI 内的预测 mesh（不含 GT、不含椭球）。
+    """
+    os.makedirs(os.path.dirname(out_ply), exist_ok=True)
+    m_pr = _roi_mask_vertices(v_pred, K, roi_xywh)
+    f = faces.long()
+    fp = f[m_pr[f].all(dim=1)]
+
+    Vp = v_pred.detach().cpu().numpy()
+    fp_np = fp.detach().cpu().numpy().astype(np.int32)
+    r, g, b = rgb
+
+    with open(out_ply, "w") as fh:
+        fh.write("ply\nformat ascii 1.0\n")
+        fh.write(f"element vertex {Vp.shape[0]}\n")
+        fh.write("property float x\nproperty float y\nproperty float z\n")
+        fh.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        fh.write(f"element face {fp_np.shape[0]}\n")
+        fh.write("property list uchar int vertex_indices\n")
+        fh.write("end_header\n")
+        for i in range(Vp.shape[0]):
+            fh.write(f"{Vp[i,0]:.6f} {Vp[i,1]:.6f} {Vp[i,2]:.6f} {int(r)} {int(g)} {int(b)}\n")
+        for i in range(fp_np.shape[0]):
+            fh.write(f"3 {fp_np[i,0]} {fp_np[i,1]} {fp_np[i,2]}\n")
+
+    print(f"[Viz] Saved: {out_ply}")
+
+
+def save_roi_ellipsoids_only_ply(
+    centers_pred: torch.Tensor,
+    ellipsoid_log_scales: torch.Tensor,
+    K: torch.Tensor,
+    roi_xywh,
+    out_ply: str,
+    max_ellipsoids: int = 400,
+    ellipsoid_level: int = 1,
+    rgb=(255, 0, 0),
+):
+    """
+    仅保存 ROI 内的椭球（不含 mesh）。
+    """
+    os.makedirs(os.path.dirname(out_ply), exist_ok=True)
+
+    cp = centers_pred.detach()
+    sp = ellipsoid_log_scales.detach()
+
+    mpc = _roi_mask_vertices(cp, K, roi_xywh)
+    cp = cp[mpc]
+    sp = sp[mpc]
+
+    n = int(cp.shape[0])
+    if n > max_ellipsoids:
+        idx = torch.linspace(0, n - 1, steps=max_ellipsoids).long().to(cp.device)
+        cp = cp[idx]
+        sp = sp[idx]
+
+    cp_np = cp.cpu().numpy()
+    scales_np = torch.exp(sp).cpu().numpy()  # (M,3)
+
+    EV, EF = _icosphere(level=ellipsoid_level)
+    EV = EV.astype(np.float32)
+    EF = EF.astype(np.int32)
+
+    verts = []
+    faces_out = []
+
+    offset = 0
+    for c, s in zip(cp_np, scales_np):
+        v_e = EV * s[None, :] + c[None, :]
+        verts.append(v_e)
+        for tri in EF:
+            faces_out.append([tri[0] + offset, tri[1] + offset, tri[2] + offset])
+        offset += v_e.shape[0]
+
+    if len(verts) == 0:
+        V_all = np.zeros((0, 3), dtype=np.float32)
+        F_all = np.zeros((0, 3), dtype=np.int32)
+    else:
+        V_all = np.concatenate(verts, axis=0).astype(np.float32)
+        F_all = np.array(faces_out, dtype=np.int32)
+
+    r, g, b = rgb
+    with open(out_ply, "w") as fh:
+        fh.write("ply\nformat ascii 1.0\n")
+        fh.write(f"element vertex {V_all.shape[0]}\n")
+        fh.write("property float x\nproperty float y\nproperty float z\n")
+        fh.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        fh.write(f"element face {F_all.shape[0]}\n")
+        fh.write("property list uchar int vertex_indices\n")
+        fh.write("end_header\n")
+        for i in range(V_all.shape[0]):
+            fh.write(f"{V_all[i,0]:.6f} {V_all[i,1]:.6f} {V_all[i,2]:.6f} {int(r)} {int(g)} {int(b)}\n")
+        for i in range(F_all.shape[0]):
+            fh.write(f"3 {F_all[i,0]} {F_all[i,1]} {F_all[i,2]}\n")
+
+    print(f"[Viz] Saved: {out_ply}")

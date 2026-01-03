@@ -18,7 +18,7 @@ from pipeline.config_pipeline import DEPTH_SYN_ROT_GT, DEPTH_SYN_TRANS_GT
 
 # --- 引入 Stage 1 模块 ---
 from stage1.config_stage1 import CFG_STAGE1
-from stage1.camera import build_K, apply_rigid
+from stage1.camera import build_K, apply_rigid, axis_angle_to_matrix
 from stage1.roi import roi_meta
 from stage1.render_depth import render_gaussian_depth
 from stage1.optim_root import optimize_root
@@ -118,8 +118,9 @@ def gen_synthetic_data(mesh_obj_ignored, out_dir):
     print(f"    -> Generated Mesh: {mesh.vertices.shape} vertices")
     
     # 高密度采样 (200k点)
-    points_surface, _ = trimesh.sample.sample_surface(mesh, 200000)
+    points_surface, face_idx = trimesh.sample.sample_surface(mesh, 200000000)
     V_dense = torch.from_numpy(points_surface).float().to(device)
+    N_dense = torch.from_numpy(mesh.face_normals[face_idx]).float().to(device)
 
     # 4. 渲染深度
     K = build_K(**CFG_STAGE1["K"], device=device)
@@ -131,6 +132,11 @@ def gen_synthetic_data(mesh_obj_ignored, out_dir):
 
     with torch.no_grad():
         Vc = apply_rigid(V_dense, rot_gt, trans_gt)
+        R = axis_angle_to_matrix(rot_gt[None])[0]
+        Nc = N_dense @ R.t()
+        front = (Vc[:, 2] > 1e-6) & ((Nc * Vc).sum(dim=1) < 0.0)
+        Vc = Vc[front]
+
         depth_obs = render_gaussian_depth(
             Vc, K, roi['roi_wh'], roi_cfg, radius=0.002
         )
@@ -305,7 +311,8 @@ def main():
     args = parser.parse_args()
 
     # [Hardcode] 固定数据源 (Mode 1 历史数据)
-    FIXED_DIR = "/home/hsmr/MassageRobot_Project/RobotBridge/output/20251218_201849_mode1"
+    FIXED_DIR = "/home/hsmr/MassageRobot_Project/RobotBridge/output/data_20260103_211520"
+    # FIXED_DIR = "/home/hsmr/MassageRobot_Project/RobotBridge/output/20251218_201849_mode1"
     FIXED_DEPTH_NPY = os.path.join(FIXED_DIR, "source_data", "depth_obs.npy")
     FIXED_S1_NPZ = os.path.join(FIXED_DIR, "stage1", "stage1_result.npz")
 
