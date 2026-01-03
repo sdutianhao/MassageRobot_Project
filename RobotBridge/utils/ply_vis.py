@@ -312,3 +312,69 @@ def save_roi_mesh_ellipsoids_ply(
             fh.write(f"3 {F_all[i,0]} {F_all[i,1]} {F_all[i,2]}\n")
 
     print(f"[Viz] Saved: {out_ply}")
+
+def save_roi_pred_ellipsoids_only_ply(
+    v_pred: torch.Tensor,
+    faces: torch.Tensor,
+    K: torch.Tensor,
+    roi_xywh,
+    centers_pred: torch.Tensor,
+    ellipsoid_log_scales: torch.Tensor,
+    out_ply: str,
+    max_ellipsoids: int = 400,
+    ellipsoid_level: int = 1
+):
+    """
+    仅保存 ROI 内的预测结果：pred(绿) + ROI 椭球(红)。不包含 GT。
+    """
+    os.makedirs(os.path.dirname(out_ply), exist_ok=True)
+    m_pr = _roi_mask_vertices(v_pred, K, roi_xywh)
+    f = faces.long()
+    fp = f[m_pr[f].all(dim=1)]
+    Vp = v_pred.detach().cpu().numpy()
+    fp_np = fp.detach().cpu().numpy().astype(np.int32)
+    cp = centers_pred.detach()
+    sp = ellipsoid_log_scales.detach()
+    mpc = _roi_mask_vertices(cp, K, roi_xywh)
+    cp = cp[mpc]
+    sp = sp[mpc]
+    def subsample_pair(C, S):
+        n = int(C.shape[0])
+        if n <= max_ellipsoids: return C, S
+        idx = torch.linspace(0, n - 1, steps=max_ellipsoids).long().to(C.device)
+        return C[idx], S[idx]
+    cp, sp = subsample_pair(cp, sp)
+    cp_np = cp.cpu().numpy()
+    scales_np = torch.exp(sp).cpu().numpy()
+    EV, EF = _icosphere(level=ellipsoid_level)
+    EV = EV.astype(np.float32)
+    EF = EF.astype(np.int32)
+    verts, colors, faces_out = [], [], []
+    offset_pr = 0
+    verts.append(Vp)
+    colors.append(np.tile(np.array([[0, 255, 0]], dtype=np.uint8), (Vp.shape[0], 1)))
+    for tri in fp_np:
+        faces_out.append([tri[0] + offset_pr, tri[1] + offset_pr, tri[2] + offset_pr])
+    offset_e = offset_pr + Vp.shape[0]
+    for c, s in zip(cp_np, scales_np):
+        v_e = EV * s[None, :] + c[None, :]
+        verts.append(v_e)
+        colors.append(np.tile(np.array([[255, 0, 0]], dtype=np.uint8), (v_e.shape[0], 1)))
+        for tri in EF:
+            faces_out.append([tri[0] + offset_e, tri[1] + offset_e, tri[2] + offset_e])
+        offset_e += v_e.shape[0]
+    V_all = np.concatenate(verts, axis=0).astype(np.float32)
+    C_all = np.concatenate(colors, axis=0).astype(np.uint8)
+    F_all = np.array(faces_out, dtype=np.int32)
+    with open(out_ply, "w") as fh:
+        fh.write("ply\nformat ascii 1.0\n")
+        fh.write(f"element vertex {V_all.shape[0]}\n")
+        fh.write("property float x\nproperty float y\nproperty float z\n")
+        fh.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        fh.write(f"element face {F_all.shape[0]}\n")
+        fh.write("property list uchar int vertex_indices\nend_header\n")
+        for i in range(V_all.shape[0]):
+            fh.write(f"{V_all[i,0]:.6f} {V_all[i,1]:.6f} {V_all[i,2]:.6f} {int(C_all[i,0])} {int(C_all[i,1])} {int(C_all[i,2])}\n")
+        for i in range(F_all.shape[0]):
+            fh.write(f"3 {F_all[i,0]} {F_all[i,1]} {F_all[i,2]}\n")
+    print(f"[Viz] Saved Pred-Only ROI: {out_ply}")

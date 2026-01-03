@@ -16,6 +16,28 @@ def _sample_valid_roi_pixels(depth_obs: torch.Tensor, num_pix: int):
     return j, i, D
 
 
+def _depth_gate_centers_cam(centers_cam: torch.Tensor, K: torch.Tensor, roi_xywh, depth_obs: torch.Tensor, tau: float):
+    """单视角深度只约束前表面：过滤掉明显在观测深度后方的中心。tau=允许后退量(米)。"""
+    if float(tau) <= 0.0:
+        return torch.ones((centers_cam.shape[0],), device=centers_cam.device, dtype=torch.bool)
+
+    rx, ry = float(roi_xywh[0]), float(roi_xywh[1])
+    roi_h, roi_w = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+
+    uv, _ = project_points(centers_cam, K)
+    u = uv[:, 0] - rx
+    v = uv[:, 1] - ry
+    z = centers_cam[:, 2]
+
+    in_img = (z > 1e-6) & (u >= 0) & (u < roi_w) & (v >= 0) & (v < roi_h)
+
+    i = torch.round(u).long().clamp(0, roi_w - 1)
+    j = torch.round(v).long().clamp(0, roi_h - 1)
+    D = depth_obs[j, i]
+    valid = (D > 1e-4) & (D < 50.0)
+
+    return in_img & valid & (z <= (D + float(tau)))
+
 def ray_overlap_nll(
     centers_cam: torch.Tensor,
     K: torch.Tensor,
@@ -30,6 +52,7 @@ def ray_overlap_nll(
     use_anisotropic: bool = True,
     learn_ellipsoid: bool = False,
     num_t: int = 5,
+    vis_depth_gate: float = 0.0,
 ):
     """
     概率射线重叠 NLL（像素采样版）
@@ -63,6 +86,15 @@ def ray_overlap_nll(
         centers = centers[sel]
         if logs is not None:
             logs = logs[sel]
+
+    # 1.5) 可见性门控：单视角深度只约束前表面，过滤掉明显在观测深度后方的中心（避免背面吸附）
+    if float(vis_depth_gate) > 0.0:
+        mg = _depth_gate_centers_cam(centers, K, roi_xywh, depth_obs, float(vis_depth_gate))
+        centers = centers[mg]
+        if logs is not None:
+            logs = logs[mg]
+        if centers.shape[0] == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True), {"num_centers": 0, "num_pix": 0}
 
     # 2) 采样 ROI 内有效像素
     j, i, D = _sample_valid_roi_pixels(depth_obs, num_pix=num_pix)

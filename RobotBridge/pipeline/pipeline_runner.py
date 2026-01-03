@@ -240,15 +240,18 @@ def run_stage2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0)
         "--out_dir", out_dir,
         "--init_noise_std", str(init_noise_std)
     ]
+
+
     subprocess.check_call(cmd)
     return os.path.join(out_dir, "theta_opt.npy")
 
 
-def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0):
+def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
+               stage3_data_term="ray", stage3_gmm_sigma_start=0.05, stage3_gmm_sigma_end=0.005, stage3_vis_depth_gate=-1.0, stage3_debug=False, stage3_debug_every=25, stage3_debug_dump=False):
     """
     调用 stage3.run_stage3_pipeline
     """
-    print(f"[*] Running Stage 3 (Micro-Skin) -> {out_dir} [Noise={init_noise_std}]")
+    print(f"[*] Running Stage 3 (Micro-Skin) -> {out_dir} [Noise={init_noise_std} Term={stage3_data_term}]")
     _ensure_dir(out_dir)
     cmd = [
         sys.executable, "-m", "stage3.run_stage3_pipeline",
@@ -258,8 +261,17 @@ def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0)
         "--out_dir", out_dir,
         "--init_noise_std", str(init_noise_std),
         "--lr", "0.005",
-        "--epochs", "200"
+        "--epochs", "200",
+        "--data_term", str(stage3_data_term),
+        "--gmm_sigma_start", str(stage3_gmm_sigma_start),
+        "--gmm_sigma_end", str(stage3_gmm_sigma_end),
+        "--vis_depth_gate", str(stage3_vis_depth_gate)
     ]
+    if bool(stage3_debug):
+        cmd += ["--debug", "--debug_every", str(int(stage3_debug_every))]
+        if bool(stage3_debug_dump):
+            cmd += ["--debug_dump"]
+        print("[Stage3][DBG] enabled:", " ".join(cmd))
     subprocess.check_call(cmd)
     return os.path.join(out_dir, "displacement_opt.npy")
 
@@ -281,6 +293,15 @@ def main():
     parser.add_argument('--perturb_theta', action='store_true', help="[Stage 2] 对初始骨架参数加噪")
     parser.add_argument('--perturb_vertices', action='store_true', help="[Stage 3] 对初始顶点加噪")
 
+    # Stage3 GMM 控制参数
+    parser.add_argument('--stage3_data_term', type=str, default='ray', choices=['ray', 'gmm'])
+    parser.add_argument('--stage3_gmm_sigma_start', type=float, default=0.05)
+    parser.add_argument('--stage3_gmm_sigma_end', type=float, default=0.005)
+    parser.add_argument('--stage3_vis_depth_gate', type=float, default=-1.0)
+    parser.add_argument('--stage3_debug', action='store_true')
+    parser.add_argument('--stage3_debug_every', type=int, default=25)
+    parser.add_argument('--stage3_debug_dump', action='store_true')
+
     args = parser.parse_args()
 
     # [Hardcode] 固定数据源 (Mode 1 历史数据)
@@ -289,7 +310,6 @@ def main():
     FIXED_S1_NPZ = os.path.join(FIXED_DIR, "stage1", "stage1_result.npz")
 
     # [命名规则修正] 格式: {task}_{timestamp}
-    # 目的: 让文件夹名直观反映任务内容 (如 stage3_2025...)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     
     if len(args.steps) == 1:
@@ -302,7 +322,7 @@ def main():
         # 混合步骤
         prefix = "_".join(args.steps)
         
-    dir_name = f"{prefix}_{timestamp}" # e.g. "stage3_20251220_120000"
+    dir_name = f"{prefix}_{timestamp}"
     
     run_dir = _ensure_dir(os.path.join(OUT_ROOT, dir_name))
     print(f"=== Pipeline Start | ID: {dir_name} ===")
@@ -367,7 +387,16 @@ def main():
         if not depth_obs_path: raise ValueError("Depth obs missing")
 
         noise_vert = 0.01 if args.perturb_vertices else 0.0
-        run_stage3(MESH_OBJ, stage1_npz, depth_obs_path, os.path.join(run_dir, "stage3"), noise_vert)
+        run_stage3(
+            MESH_OBJ, stage1_npz, depth_obs_path, os.path.join(run_dir, "stage3"), noise_vert,
+            stage3_data_term=args.stage3_data_term,
+            stage3_gmm_sigma_start=args.stage3_gmm_sigma_start,
+            stage3_gmm_sigma_end=args.stage3_gmm_sigma_end,
+            stage3_vis_depth_gate=args.stage3_vis_depth_gate,
+            stage3_debug=args.stage3_debug,
+            stage3_debug_every=args.stage3_debug_every,
+            stage3_debug_dump=args.stage3_debug_dump
+        )
 
     print(f"=== Pipeline Finished | Results: {run_dir} ===")
 

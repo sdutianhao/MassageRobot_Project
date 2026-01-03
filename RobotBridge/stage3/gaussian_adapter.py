@@ -34,6 +34,10 @@ class GaussianSkinModel(nn.Module):
         rot: torch.Tensor,               # (3,3)
         trans: torch.Tensor,             # (1,3) or (3,)
         roi_xywh,
+        roi_v_idx_override=None,
+        roi_f_idx_override=None,
+        depth_obs: torch.Tensor = None,
+        vis_depth_gate: float = 0.0,
         ellipsoid_s0: float = 0.01,      # 固定大小（10mm）
         max_ellipsoids: int = 5000,
         chunk_k: int = 1024,
@@ -57,31 +61,47 @@ class GaussianSkinModel(nn.Module):
 
         # ---- 固定 ROI 顶点集合（用 base 投影选一次） ----
         with torch.no_grad():
-            v_cam0 = apply_rigid(self.base_verts, self.rot, self.trans)
-            vmask = _roi_mask_points_cam(v_cam0, self.K, self.roi_xywh)
-            roi_v_idx = torch.where(vmask)[0].long()
-            if roi_v_idx.numel() == 0:
-                roi_v_idx = torch.arange(self.base_verts.shape[0], device=device).long()
+            if roi_v_idx_override is not None:
+                roi_v_idx = roi_v_idx_override.detach().to(device).long()
+            else:
+                v_cam0 = apply_rigid(self.base_verts, self.rot0, self.trans0)
+                vmask = _roi_mask_points_cam(v_cam0, self.K, self.roi_xywh)
+                roi_v_idx = torch.where(vmask)[0].long()
+                if roi_v_idx.numel() == 0:
+                    roi_v_idx = torch.arange(self.base_verts.shape[0], device=device).long()
             self.register_buffer("roi_v_idx", roi_v_idx)
 
-        # ---- 固定 ROI faces 子集（椭球索引集合），但中心由 V' 质心实时计算 ----
+# ---- 固定 ROI faces 子集（用 base 投影选一次） ----
         with torch.no_grad():
-            tri0 = self.base_verts[self.faces]                      # (F,3,3)
-            c0_world = tri0.mean(dim=1)                             # (F,3)
-            c0_cam = apply_rigid(c0_world, self.rot, self.trans)    # (F,3)
-            fmask = _roi_mask_points_cam(c0_cam, self.K, self.roi_xywh)
-            roi_f_idx = torch.where(fmask)[0].long()
-            if roi_f_idx.numel() == 0:
-                roi_f_idx = torch.arange(c0_world.shape[0], device=device).long()
+            if roi_f_idx_override is not None:
+                roi_f_idx = roi_f_idx_override.detach().to(device).long()
+            else:
+                v_cam0 = apply_rigid(self.base_verts, self.rot0, self.trans0)
+                f = self.faces
+                tri0 = v_cam0[f]  # (F,3,3) in cam
+                c0_cam = tri0.mean(dim=1)  # (F,3)
+                fmask = _roi_mask_points_cam(c0_cam, self.K, self.roi_xywh)
+                roi_f_idx = torch.where(fmask)[0].long()
+                if roi_f_idx.numel() == 0:
+                    roi_f_idx = torch.arange(f.shape[0], device=device).long()
 
-            if roi_f_idx.numel() > self.max_ellipsoids:
-                sel = torch.linspace(0, roi_f_idx.numel() - 1, steps=self.max_ellipsoids, device=device).long()
+            if roi_f_idx.numel() > int(max_ellipsoids):
+                sel = torch.linspace(
+                    0, roi_f_idx.numel() - 1,
+                    steps=int(max_ellipsoids),
+                    device=device
+                ).long()
                 roi_f_idx = roi_f_idx[sel]
 
             self.register_buffer("roi_f_idx", roi_f_idx)
-            self.register_buffer("roi_faces", self.faces[roi_f_idx].clone().detach())     # (K,3)
-            # 权重场使用的 anchor（固定）：base face 质心
-            self.register_buffer("centers0_world", c0_world[roi_f_idx].clone().detach()) # (K,3)
+            self.register_buffer("roi_faces", self.faces[roi_f_idx])  # (K,3)
+
+        # base face centers（世界系）
+        with torch.no_grad():
+            tri0 = self.base_verts[self.roi_faces]  # (K,3,3)
+            c0_world = tri0.mean(dim=1)             # (K,3)
+            self.register_buffer("centers0_world", c0_world)
+
 
         K_ell = int(self.roi_faces.shape[0])
 
@@ -140,6 +160,8 @@ class GaussianSkinModel(nn.Module):
 
         sum_w = torch.zeros((M,), device=device)
         sum_d = torch.zeros((M, 3), device=device)
+        max_w = torch.zeros((M,), device=device)
+        sum_w2 = torch.zeros((M,), device=device)
 
         for s in range(0, K_ell, self.chunk_k):
             e = min(s + self.chunk_k, K_ell)
@@ -150,11 +172,17 @@ class GaussianSkinModel(nn.Module):
             diff = V_roi[:, None, :] - Cc[None, :, :]                 # (M,kc,3)
             quad = (diff * diff * invc[None, :, :]).sum(dim=2)        # (M,kc)
             w = torch.exp(-0.5 * quad)                                # (M,kc)
+            max_w = torch.maximum(max_w, w.max(dim=1).values)
+            sum_w2 = sum_w2 + (w * w).sum(dim=1)
 
             sum_w = sum_w + w.sum(dim=1)
             sum_d = sum_d + (w @ dc)
 
         delta_roi = sum_d / (sum_w[:, None] + eps)  # (M,3)
+        # debug cache (for diagnostics)
+        self._dbg_sum_w = sum_w.detach()
+        self._dbg_max_w = max_w.detach()
+        self._dbg_eff_k = (sum_w * sum_w / (sum_w2 + eps)).detach()
 
         delta = torch.zeros_like(V)
         delta[idx] = delta_roi
