@@ -191,3 +191,94 @@ class GaussianSkinModel(nn.Module):
         # cache centers from deformed mesh（用于外部查看/调试）
         self._last_centers_world = self.ellipsoid_centers_world(V_def).detach()
         return V_def
+
+
+class GaussianSkinModelVertexGMM(nn.Module):
+    """
+    新增方案（GMM + verts）：
+    - 椭球中心=ROI 顶点（皮肤顶点）
+    - 取消权重场：不再用协方差生成 w_ik 传播位移
+    - 直接优化 ROI 顶点位移 + 各向异性尺度（体积固定）
+    """
+    def __init__(
+        self,
+        init_vertices: torch.Tensor,
+        faces: torch.Tensor,
+        K: torch.Tensor,
+        rot: torch.Tensor,
+        trans: torch.Tensor,
+        roi_xywh,
+        roi_v_idx_override=None,
+        roi_f_idx_override=None,
+        depth_obs: torch.Tensor = None,
+        vis_depth_gate: float = 0.0,
+        ellipsoid_s0: float = 0.01,
+        max_ellipsoids: int = 5000,
+        chunk_k: int = 1024,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        if init_vertices.dim() == 3 and init_vertices.shape[0] == 1:
+            init_vertices = init_vertices[0]
+
+        self.device = device
+        self.register_buffer("base_verts", init_vertices.clone().detach().to(device))
+        self.register_buffer("faces", faces.clone().detach().to(device))
+        self.register_buffer("K", K.clone().detach().to(device))
+        self.register_buffer("rot", rot.clone().detach().to(device))
+        self.register_buffer("trans", trans.reshape(1, 3).clone().detach().to(device))
+        self.roi_xywh = [float(x) for x in roi_xywh]
+
+        self.ellipsoid_s0 = float(ellipsoid_s0)
+        self.max_ellipsoids = int(max_ellipsoids)
+        self.chunk_k = int(chunk_k)
+
+        with torch.no_grad():
+            if roi_v_idx_override is not None:
+                roi_v_idx = roi_v_idx_override.detach().to(device).long()
+            else:
+                v_cam0 = apply_rigid(self.base_verts, self.rot, self.trans)
+                vmask = _roi_mask_points_cam(v_cam0, self.K, self.roi_xywh)
+                roi_v_idx = torch.where(vmask)[0].long()
+                if roi_v_idx.numel() == 0:
+                    roi_v_idx = torch.arange(self.base_verts.shape[0], device=device).long()
+            self.register_buffer("roi_v_idx", roi_v_idx)
+            # 兼容旧字段
+            self.register_buffer("roi_f_idx", torch.empty((0,), device=device, dtype=torch.long))
+            self.register_buffer("roi_faces", torch.empty((0, 3), device=device, dtype=torch.long))
+
+        M = int(self.roi_v_idx.numel())
+        self.ellipsoid_disp = nn.Parameter(torch.zeros((M, 3), device=device))
+        self.ellipsoid_shape_raw = nn.Parameter(torch.zeros((M, 3), device=device))
+        self._last_centers_world = None
+
+    def shape_l(self):
+        return self.ellipsoid_shape_raw - self.ellipsoid_shape_raw.mean(dim=1, keepdim=True)
+
+    def ellipsoid_log_scales(self):
+        log_s0 = torch.log(torch.tensor(self.ellipsoid_s0, device=self.base_verts.device) + 1e-12)
+        return log_s0 + self.shape_l()
+
+    def ellipsoid_centers_world(self, vertices_world: torch.Tensor = None):
+        if vertices_world is None:
+            vertices_world = self.base_verts
+        if vertices_world.dim() == 3 and vertices_world.shape[0] == 1:
+            vertices_world = vertices_world[0]
+        return vertices_world[self.roi_v_idx]
+
+    def ellipsoid_centers_cam(self, vertices_world: torch.Tensor = None):
+        c_world = self.ellipsoid_centers_world(vertices_world)
+        c_cam = apply_rigid(c_world, self.rot, self.trans)
+        if c_cam.dim() == 3 and c_cam.shape[0] == 1:
+            c_cam = c_cam[0]
+        return c_cam
+
+    def forward(self):
+        V_def = self.base_verts.clone()
+        V_def[self.roi_v_idx] = V_def[self.roi_v_idx] + self.ellipsoid_disp
+        # 无 weight cache
+        self._dbg_sum_w = None
+        self._dbg_max_w = None
+        self._dbg_eff_k = None
+        self._last_centers_world = self.ellipsoid_centers_world(V_def).detach()
+        return V_def

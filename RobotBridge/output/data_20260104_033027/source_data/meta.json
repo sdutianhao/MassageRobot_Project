@@ -1,0 +1,27 @@
+{
+  "K": [
+    [
+      600.0,
+      0.0,
+      320.0
+    ],
+    [
+      0.0,
+      600.0,
+      240.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "roi_xywh": [
+    0,
+    100,
+    440,
+    280
+  ],
+  "source_type": "generated_from_skel_params",
+  "source_npz": "/home/hsmr/MassageRobot_Project/RobotBridge/experiments/synthetic_case_001/skeleton/HSMR-ballerina.png.npz"
+}

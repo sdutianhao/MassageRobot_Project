@@ -20,9 +20,7 @@ from utils.ply_vis import save_roi_mesh_ellipsoids_ply, save_roi_pred_ellipsoids
 from utils.metrics import mean_vertex_deviation
 from utils.vis_roi import save_overlay_ellipsoids_gt_png
 
-from stage3.gaussian_adapter import GaussianSkinModel
-
-
+from stage3.gaussian_adapter import GaussianSkinModel, GaussianSkinModelVertexGMM
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mesh_obj", default="IGNORED")
@@ -37,7 +35,7 @@ def main():
     ap.add_argument("--max_ellipsoids", type=int, default=5000)
     ap.add_argument("--sigma_z", type=float, default=0.004)
     ap.add_argument("--sigma_space", type=float, default=0.03)
-    ap.add_argument("--num_pix", type=int, default=2048)
+    ap.add_argument("--num_pix", type=int, default=204800)
     ap.add_argument("--num_t", type=int, default=5)
 
     ap.add_argument("--lambda_disp", type=float, default=10.0)
@@ -49,6 +47,8 @@ def main():
     ap.add_argument("--data_term", type=str, default="ray", choices=["ray", "gmm"])
     ap.add_argument("--gmm_sigma_start", type=float, default=0.05)
     ap.add_argument("--gmm_sigma_end", type=float, default=0.005)
+
+    ap.add_argument("--gmm_center_mode", type=str, default="faces", choices=["faces", "verts"])
 
     ap.add_argument("--vis_depth_gate", type=float, default=-1.0)
     ap.add_argument("--debug", action="store_true")
@@ -69,6 +69,7 @@ def main():
     # 1. Load Data
     s1 = np.load(args.stage1_npz)
     K = torch.from_numpy(s1["K"]).float().to(device)
+
     rot = torch.from_numpy(s1["rot"]).float().to(device)
     trans = torch.from_numpy(s1["trans"]).float().to(device)
     roi_xywh = s1["roi_xywh"].tolist() if hasattr(s1["roi_xywh"], "tolist") else list(s1["roi_xywh"])
@@ -94,10 +95,10 @@ def main():
     faces_cpu = skel.faces
     faces_gpu = torch.tensor(skel.faces.astype(np.int32), device=device).long()
 
+    v_init = v_gt.clone()
     if args.init_noise_std > 0:
-        v_init = v_gt + torch.randn_like(v_gt) * float(args.init_noise_std)
-    else:
-        v_init = v_gt.clone()
+        idx = torch.arange(0, v_init.shape[0], 2, device=v_init.device)
+        v_init[idx] += torch.randn_like(v_init[idx]) * float(args.init_noise_std)
 
     # ==========================================================
     # 3. 核心逻辑：静态筛选与门控解耦
@@ -184,7 +185,9 @@ def main():
 
 
     # 4. Init Model
-    model = GaussianSkinModel(
+    is_gmm_vertex = (args.data_term == "gmm") and (args.gmm_center_mode == "verts")
+    ModelCls = GaussianSkinModelVertexGMM if is_gmm_vertex else GaussianSkinModel
+    model = ModelCls(
         init_vertices=v_init,
         faces=faces_gpu,
         K=K,
@@ -201,6 +204,8 @@ def main():
         chunk_k=1024,
         device=str(device),
     ).to(device)
+
+    ell_count = int(model.roi_v_idx.numel()) if is_gmm_vertex else int(model.roi_faces.shape[0])
 
     optimizer = optim.Adam([
         {"params": [model.ellipsoid_disp], "lr": float(args.lr)},
@@ -229,7 +234,7 @@ def main():
         c_start_cam = model.ellipsoid_centers_cam(v_start)
         log_s_start = model.ellipsoid_log_scales()
 
-        vis_all_ell = int(model.roi_faces.shape[0])
+        vis_all_ell = int(ell_count)
 
         save_roi_mesh_ellipsoids_ply(
             v_gt=v_gt_cam,
@@ -286,7 +291,7 @@ def main():
         )
         save_depth_vis(depth_pred_start, os.path.join(dir_vis, "depth_pred_start.png"))
 
-    print(f"[Stage3] iters={int(args.epochs)} | lr={float(args.lr)} | ellipsoids={int(model.roi_faces.shape[0])} | roi_verts={int(model.roi_v_idx.numel())}")
+    print(f"[Stage3] iters={int(args.epochs)} | lr={float(args.lr)} | ellipsoids={int(ell_count)} | roi_verts={int(model.roi_v_idx.numel())}")
     print(f"[Stage3] reg: lambda_disp={float(args.lambda_disp)} lambda_shape={float(args.lambda_shape)}")
     
     print(f"[Stage3] data_term={args.data_term}")
@@ -489,7 +494,7 @@ def main():
                     it,
                     float(loss.item()), float(loss_nll.item()), float(loss_disp_reg.item()), float(loss_shape_reg.item()),
                     sigma_now,
-                    int(model.roi_v_idx.numel()), int(model.roi_faces.shape[0]), int(stats.get("num_centers", -1)),
+                    int(model.roi_v_idx.numel()), int(ell_count), int(stats.get("num_centers", -1)),
                     n_inimg, n_gz, n_gt, gz_ratio, gate_flips,
                     rz_s["mean"], rz_s["p90"], rz_s["max"], rt_s["mean"], rt_s["p90"], rt_s["max"],
                     dv_s["mean"], dv_s["p95"], dv_s["max"], dz_s["mean"], dz_s["p95"], dz_s["max"],
@@ -552,7 +557,7 @@ def main():
         c_end_cam = model.ellipsoid_centers_cam(v_end)
         log_s_end = model.ellipsoid_log_scales()
 
-        vis_all_ell = int(model.roi_faces.shape[0])
+        vis_all_ell = int(ell_count)
 
         # 1. Comparison
         save_roi_mesh_ellipsoids_ply(
@@ -627,7 +632,7 @@ def main():
 
     print(f"[*] Done. Results -> {args.out_dir}")
     if not args.no_report_metrics:
-        print(f"[Stage3][ROIMeanDev] start={roi_dev_start:.6f}m end={roi_dev_end:.6f}m")
+        print(f"[Stage3][ROIMeanDev] start={roi_dev_start*100:.4f}cm end={roi_dev_end*100:.4f}cm")
 
 
 if __name__ == "__main__":

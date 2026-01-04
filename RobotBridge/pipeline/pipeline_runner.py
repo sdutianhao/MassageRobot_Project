@@ -118,7 +118,7 @@ def gen_synthetic_data(mesh_obj_ignored, out_dir):
     print(f"    -> Generated Mesh: {mesh.vertices.shape} vertices")
     
     # 高密度采样 (200k点)
-    points_surface, face_idx = trimesh.sample.sample_surface(mesh, 200000000)
+    points_surface, face_idx = trimesh.sample.sample_surface(mesh, 200000)
     V_dense = torch.from_numpy(points_surface).float().to(device)
     N_dense = torch.from_numpy(mesh.face_normals[face_idx]).float().to(device)
 
@@ -253,7 +253,9 @@ def run_stage2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0)
 
 
 def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
-               stage3_data_term="ray", stage3_gmm_sigma_start=0.05, stage3_gmm_sigma_end=0.005, stage3_vis_depth_gate=-1.0, stage3_debug=False, stage3_debug_every=25, stage3_debug_dump=False):
+               stage3_data_term="ray", stage3_gmm_sigma_start=0.05, stage3_gmm_sigma_end=0.005,
+               stage3_gmm_center_mode="faces",
+               stage3_vis_depth_gate=-1.0, stage3_debug=False, stage3_debug_every=25, stage3_debug_dump=False):
     """
     调用 stage3.run_stage3_pipeline
     """
@@ -273,6 +275,8 @@ def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
         "--gmm_sigma_end", str(stage3_gmm_sigma_end),
         "--vis_depth_gate", str(stage3_vis_depth_gate)
     ]
+    if str(stage3_data_term) == "gmm" and str(stage3_gmm_center_mode) != "faces":
+        cmd += ["--gmm_center_mode", str(stage3_gmm_center_mode)]
     if bool(stage3_debug):
         cmd += ["--debug", "--debug_every", str(int(stage3_debug_every))]
         if bool(stage3_debug_dump):
@@ -303,6 +307,7 @@ def main():
     parser.add_argument('--stage3_data_term', type=str, default='ray', choices=['ray', 'gmm'])
     parser.add_argument('--stage3_gmm_sigma_start', type=float, default=0.05)
     parser.add_argument('--stage3_gmm_sigma_end', type=float, default=0.005)
+    parser.add_argument('--stage3_gmm_center_mode', type=str, default='faces', choices=['faces', 'verts'])
     parser.add_argument('--stage3_vis_depth_gate', type=float, default=-1.0)
     parser.add_argument('--stage3_debug', action='store_true')
     parser.add_argument('--stage3_debug_every', type=int, default=25)
@@ -311,7 +316,7 @@ def main():
     args = parser.parse_args()
 
     # [Hardcode] 固定数据源 (Mode 1 历史数据)
-    FIXED_DIR = "/home/hsmr/MassageRobot_Project/RobotBridge/output/data_20260103_211520"
+    FIXED_DIR = "/home/hsmr/MassageRobot_Project/RobotBridge/output/data_20260104_032505"
     # FIXED_DIR = "/home/hsmr/MassageRobot_Project/RobotBridge/output/20251218_201849_mode1"
     FIXED_DEPTH_NPY = os.path.join(FIXED_DIR, "source_data", "depth_obs.npy")
     FIXED_S1_NPZ = os.path.join(FIXED_DIR, "stage1", "stage1_result.npz")
@@ -399,6 +404,7 @@ def main():
             stage3_data_term=args.stage3_data_term,
             stage3_gmm_sigma_start=args.stage3_gmm_sigma_start,
             stage3_gmm_sigma_end=args.stage3_gmm_sigma_end,
+            stage3_gmm_center_mode=args.stage3_gmm_center_mode,
             stage3_vis_depth_gate=args.stage3_vis_depth_gate,
             stage3_debug=args.stage3_debug,
             stage3_debug_every=args.stage3_debug_every,

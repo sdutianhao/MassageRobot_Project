@@ -3,7 +3,8 @@ CFG_STAGE1 = {
 
     # Image / ROI
     "img_wh": (640, 480),
-    "roi_xywh": (100, 100, 540, 280),
+    # "roi_xywh": (0, 0, 640, 480),
+    "roi_xywh": (0, 100, 440, 280),
     "roi_depth_unit": "meter",
 
     # Camera intrinsics
