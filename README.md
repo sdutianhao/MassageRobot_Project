@@ -1,232 +1,90 @@
-下面给你**一份完整、可直接覆盖当前 README.md 的版本**。
-仅包含 **Stage3 · GMM（verts）**，**目标函数写到可直接进论文**；
-**正则项只给公式 + 一句话目的，不做展开解释**；
-内容与当前代码与命令行 **严格一致**。
-
----
-
 # RobotBridge
 
-## 基于单视角深度的 GMM 人体局部微表面优化（Stage3）
+**Probabilistic GMM–Based Human Surface Alignment & Micro-Skin Optimization**
 
 ---
 
-## 1. 项目目标
+## 1. 项目目标（What & Why）
 
-RobotBridge 是一个以**单视角深度图**为唯一观测的人体表面几何优化框架。
-当前版本聚焦 **Stage3：ROI 内皮肤微表面（Micro-Skin）优化**，目标是在固定全局姿态的条件下，对局部皮肤几何进行高自由度、可微分的概率建模与优化。
+本项目实现了一套**以单视角深度图为唯一观测**的人体表面几何优化框架，当前版本聚焦 **Stage3：ROI 内皮肤微表面（Micro-Skin）优化**，目标是在固定全局姿态与相机参数的前提下，对局部皮肤几何进行高自由度、概率一致的优化。
 
-核心特征：
+核心目标包括：
 
-* 仅使用 2.5D 深度观测
-* ROI 局部优化
-* 概率建模（GMM Surface Likelihood）
-* 顶点级自由度 + 各向异性不确定性
-
----
-
-## 2. 几何表示
-
-### 2.1 椭球中心（GMM center）
-
-* 采用 **`verts` 模式**
-* ROI 内每一个皮肤顶点对应一个 GMM 分量
-* 第 (k) 个分量中心：
-  $$
-  \mu_k \in \mathbb R^3
-  $$
-  直接由当前迭代下的 ROI 顶点位置给出
-
-### 2.2 协方差参数化
-
-每个 GMM 分量使用各向异性高斯椭球表示，其协方差写为：
-
-$$
-\Sigma_k
-========
-
-R_k
-\operatorname{diag}(s_{k1}^2,s_{k2}^2,s_{k3}^2)
-R_k^\top
-$$
-
-其中：
-
-* ( R_k )：椭球旋转矩阵（可学习）
-* ( s_{k\cdot} )：主轴尺度（以 log-scale 形式优化）
-* 总体体积通过约束保持不变
+* 不依赖显式 3D 点云或多视角重建
+* 仅使用 ROI 深度图作为观测
+* 通过概率模型刻画深度与表面的一致性
+* 在 ROI 内恢复高频皮肤微结构
 
 ---
 
-## 3. 优化变量
+## 2. 项目整体结构（Project Structure）
 
-在 Stage3 中优化的变量包括：
-
-* ROI 顶点位移
-  $$
-  d_i \in \mathbb R^3
-  $$
-* 椭球 log-scale（各向异性）
-* 椭球旋转（可选，显式开启）
-
-全局姿态、相机参数保持固定。
-
----
-
-## 4. 目标函数（完整形式）
-
-Stage3 的总损失函数定义为：
-
-$$
-\mathcal L
-==========
-
-\mathcal L_{\text{GMM}}
-+
-\lambda_{\text{disp}} \mathcal L_{\text{disp}}
-+
-\lambda_{\text{shape}} \mathcal L_{\text{shape}}
-+
-\lambda_{\text{tan}} \mathcal L_{\text{tan}}
-+
-\lambda_{\text{tan-anchor}} \mathcal L_{\text{tan-anchor}}
-$$
-
----
-
-## 5. GMM 表面深度似然（核心数据项）
-
-### 5.1 定义
-
-$$
-\mathcal L_{\text{GMM}}
-=======================
-
--\frac{1}{|\mathcal P|}
-\sum_{(u,v)\in\mathcal P}
-\log
-\left(
-\frac{1}{K}
-\sum_{k=1}^{K}
-\exp
-!\left(
--\tfrac12
-,
-|x(u,v)-\mu_k|^2_{\Sigma_k^{-1}}
-\right)
-\right)
-$$
-
-### 5.2 符号说明
-
-* ( \mathcal P )：从 ROI 深度图中采样的有效像素集合
-* ( x(u,v) )：由像素 ((u,v)) 与观测深度反投影得到的 3D 点
-* ( K )：ROI 内 GMM 分量数量（等于 ROI 顶点数）
-* ( \mu_k )：第 (k) 个 GMM 分量中心
-* ( \Sigma_k )：第 (k) 个分量的协方差矩阵
-* ( |x-\mu|^2_{\Sigma^{-1}}=(x-\mu)^\top\Sigma^{-1}(x-\mu) )
-
-该项是唯一的数据一致性约束。
+```
+RobotBridge/
+├── pipeline/
+│   ├── config_pipeline.py
+│   └── pipeline_runner.py
+│
+├── stage1/
+│   ├── camera.py
+│   ├── roi.py
+│   ├── render_depth.py
+│   └── optim_root.py
+│
+├── stage2/
+│   ├── skel_adapter.py
+│   └── optim_theta.py
+│
+├── stage3/
+│   ├── gaussian_adapter.py
+│   └── run_stage3_pipeline.py
+│
+├── utils/
+│   ├── gmm_likelihood.py
+│   ├── metrics.py
+│   ├── vis.py
+│   ├── vis_roi.py
+│   └── ply_vis.py
+│
+├── experiments/
+│   └── synthetic_case_001/
+│
+├── output/
+│
+└── README.md
+```
 
 ---
 
-## 6. 正则项
+## 3. 核心数据与参数来源（Very Important）
 
-### 6.1 顶点位移正则
+### 3.1 人体几何真值
 
-$$
-\mathcal L_{\text{disp}}
-========================
+Stage3 使用 SKEL 模型生成的人体网格作为几何参考，其参数来源于：
 
-\frac{1}{N}
-\sum_{i=1}^{N}
-|d_i|^2
-$$
+```
+experiments/synthetic_case_001/skeleton/HSMR-ballerina.png.npz
+```
 
-目的：抑制局部顶点产生过大位移。
+该文件包含姿态与形状参数，用于生成 GT 网格，仅作为诊断参考。
 
 ---
 
-### 6.2 椭球形状正则（体积保持）
+### 3.2 深度观测
 
-$$
-\tilde\ell_i
-============
+在 `--use_fixed_data` 模式下，Stage3 使用固定的 ROI 深度图：
 
-## \ell_i
+```
+output/.../source_data/depth_obs.npy
+```
 
-\frac{1}{3}
-\sum_{j=1}^{3}\ell_{ij}
-$$
-
-$$
-\mathcal L_{\text{shape}}
-=========================
-
-\frac{1}{N}
-\sum_{i=1}^{N}
-|\tilde\ell_i|^2
-$$
-
-目的：允许各向异性，同时保持椭球总体积稳定。
+深度单位为米，仅作为观测数据参与优化。
 
 ---
 
-### 6.3 切向正则
+## 4. Pipeline 运行方式（How to Run）
 
-$$
-\Delta d_{ij}^{\perp}
-=====================
-
-## (d_i-d_j)
-
-\big((d_i-d_j)^\top n_i\big)n_i
-$$
-
-$$
-\mathcal L_{\text{tan}}
-=======================
-
-\frac{1}{|\mathcal E|}
-\sum_{(i,j)\in\mathcal E}
-|\Delta d_{ij}^{\perp}|^2
-$$
-
-目的：抑制切向方向的高频漂移。
-
----
-
-### 6.4 切向锚定项
-
-$$
-\mathcal L_{\text{tan-anchor}}
-==============================
-
-\left|
-\frac{1}{N}
-\sum_{i=1}^{N}
-\left(
-d_i-(d_i^\top n_i)n_i
-\right)
-\right|^2
-$$
-
-目的：防止 ROI 整体沿切向发生一致性平移。
-
----
-
-## 7. 深度可见性处理
-
-* 在优化开始前进行一次 **静态可见性筛选**
-* 条件包括：
-
-  * 投影落入 ROI
-  * 深度一致性满足阈值
-* 优化过程中不再进行逐轮动态剔除
-
----
-
-## 8. 运行方式（Stage3 · GMM）
+### 4.1 Stage3：ROI 微表面优化（GMM）
 
 ```bash
 cd ~/MassageRobot_Project/RobotBridge && \
@@ -249,28 +107,223 @@ python -m pipeline.pipeline_runner \
   --stage3_lambda_tan_anchor 100
 ```
 
+Stage3 固定全局姿态，仅在 ROI 内对皮肤顶点进行微表面优化。
+
+参数说明：
+
+--mode 1
+使用仿真闭环模式，读取固定的数据与相机配置。
+
+--steps stage3
+仅执行 Stage3（ROI 微表面优化），不运行 Stage1 / Stage2。
+
+--use_fixed_data
+使用已有的固定深度观测（depth_obs.npy），不重新生成数据。
+
+--force_gt_init
+以 GT 姿态与形状作为 Stage3 的初始几何状态，用于隔离 Stage3 行为。
+
+--perturb_vertices
+在优化前对顶点施加小扰动，用于验证优化是否能够收敛。
+
+--stage3_data_term gmm
+使用 GMM Surface Likelihood 作为唯一的数据项。
+
+--stage3_update_rot
+启用椭球旋转参数的联合优化。
+
+--stage3_gmm_center_mode verts
+将 ROI 顶点本身作为 GMM 分量中心。
+
+--stage3_gmm_sigma_start 0.05
+GMM 协方差初始尺度（粗阶段），单位为米。
+
+--stage3_gmm_sigma_end 0.005
+GMM 协方差最终尺度（细阶段），单位为米。
+
+--stage3_vis_depth_gate 0.06
+静态深度可见性筛选阈值，用于初始化阶段剔除明显不可见顶点。
+
+--stage3_debug
+启用调试统计与中间状态记录。
+
+--stage3_debug_every 40
+每 40 次迭代输出一次调试信息。
+
+--stage3_debug_dump
+保存调试用的中间结果（NPZ / CSV）。
+
+--stage3_lambda_tan 100
+切向正则项权重。
+
+--stage3_lambda_tan_anchor 100
+切向锚定正则项权重。
+
 ---
 
-## 9. 输出与指标
+## 5. 方法论概要（High-Level Logic）
 
-* ROI 网格与椭球的 PLY 可视化
-* 深度预测结果
-* 调试日志与中间状态
+Stage3 将 ROI 内的皮肤顶点视为 **高斯混合模型（GMM）分量中心**，并通过最大化预测 GMM 与观测深度在像素反投影空间中的概率一致性，实现对局部几何的优化。
 
-诊断指标：
+每个 ROI 顶点对应一个各向异性高斯椭球，椭球的中心、尺度与旋转共同描述局部表面的不确定性结构。
 
-```text
+---
+
+## 6. 目标函数（Objective Function）
+
+Stage3 的总损失函数定义为：
+
+$$
+\mathcal L
+==========
+
+\mathcal L_{\text{GMM}}
++
+\lambda_{\text{disp}} \mathcal L_{\text{disp}}
++
+\lambda_{\text{shape}} \mathcal L_{\text{shape}}
++
+\lambda_{\text{tan}} \mathcal L_{\text{tan}}
++
+\lambda_{\text{tan-anchor}} \mathcal L_{\text{tan-anchor}}
+$$
+
+---
+
+### 6.1 GMM 表面深度似然（Data Term）
+
+$$
+\mathcal L_{\text{GMM}}
+=======================
+
+-\frac{1}{|\mathcal P|}
+\sum_{(u,v)\in\mathcal P}
+\log
+\left(
+\frac{1}{K}
+\sum_{k=1}^{K}
+\exp
+!\left(
+-\tfrac12
+,
+|x(u,v)-\mu_k|^2_{\Sigma_k^{-1}}
+\right)
+\right)
+$$
+
+**符号说明：**
+
+* ( \mathcal P )：ROI 深度图中采样的有效像素集合
+* ( x(u,v) )：由像素 ((u,v)) 与观测深度反投影得到的 3D 点
+* ( K )：GMM 分量数量（等于 ROI 顶点数）
+* ( \mu_k )：第 (k) 个 GMM 分量中心（ROI 顶点）
+* ( \Sigma_k )：对应的各向异性协方差矩阵
+
+该项是唯一的数据一致性约束。
+
+---
+
+### 6.2 正则项
+
+**顶点位移正则：**
+
+$$
+\mathcal L_{\text{disp}}
+========================
+
+\frac{1}{N}
+\sum_{i=1}^{N}
+|d_i|^2
+$$
+
+目的：抑制过大的局部位移。
+
+---
+
+**椭球形状正则（体积保持）：**
+
+$$
+\tilde\ell_i
+============
+
+## \ell_i
+
+\frac{1}{3}
+\sum_{j=1}^{3}\ell_{ij}
+$$
+
+$$
+\mathcal L_{\text{shape}}
+=========================
+
+\frac{1}{N}
+\sum_{i=1}^{N}
+|\tilde\ell_i|^2
+$$
+
+目的：允许各向异性，同时保持总体体积稳定。
+
+---
+
+**切向正则：**
+
+$$
+\mathcal L_{\text{tan}}
+=======================
+
+\frac{1}{|\mathcal E|}
+\sum_{(i,j)\in\mathcal E}
+|
+(d_i-d_j)
+---------
+
+((d_i-d_j)^\top n_i)n_i
+|^2
+$$
+
+目的：抑制切向高频漂移。
+
+---
+
+**切向锚定项：**
+
+$$
+\mathcal L_{\text{tan-anchor}}
+==============================
+
+\left|
+\frac{1}{N}
+\sum_{i=1}^{N}
+\big(d_i-(d_i^\top n_i)n_i\big)
+\right|^2
+$$
+
+目的：防止 ROI 整体沿切向发生一致性平移。
+
+---
+
+## 7. 关于误差指标的说明（Important Caveat）
+
+Stage3 输出的：
+
+```
 [Stage3][ROIMeanDev] start=...cm end=...cm
 ```
 
-该指标不参与优化，仅用于分析。
+表示 ROI 顶点相对于 GT 网格的平均欧氏距离。
+该指标 **不参与优化，仅用于诊断分析**。
 
 ---
 
-## 10. 方法定位
+## 8. 当前状态与已知限制
 
-Stage3（GMM）是一个**以深度似然为核心、通过顶点级 GMM 建模局部几何不确定性的人体微表面优化模块**，适用于研究深度约束下的高自由度局部形变问题。
+* Stage3 使用 GT 姿态作为初始条件
+* 深度观测与 GT 网格可能不同源
+* 深度约束为 2.5D，存在多解性
 
 ---
 
-如果你需要，我可以**下一步直接帮你压缩成论文 Method 一节版本（2–3 页）或补充梯度/复杂度分析版**。
+## 9. 项目定位
+
+> **RobotBridge（Stage3 · GMM）是一个以单视角深度为唯一观测、通过顶点级高斯混合模型实现人体局部微表面优化的研究型工程框架。**
+
