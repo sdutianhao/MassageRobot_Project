@@ -255,7 +255,8 @@ def run_stage2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0)
 def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
                stage3_data_term="ray", stage3_gmm_sigma_start=0.05, stage3_gmm_sigma_end=0.005,
                stage3_gmm_center_mode="faces",
-               stage3_vis_depth_gate=-1.0, stage3_debug=False, stage3_debug_every=25, stage3_debug_dump=False):
+               stage3_vis_depth_gate=-1.0, stage3_debug=False, stage3_debug_every=25, stage3_debug_dump=False, stage3_update_rot=False,
+               stage3_lambda_tan=0.0, stage3_lambda_tan_anchor=0.0):
     """
     调用 stage3.run_stage3_pipeline
     """
@@ -273,10 +274,14 @@ def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
         "--data_term", str(stage3_data_term),
         "--gmm_sigma_start", str(stage3_gmm_sigma_start),
         "--gmm_sigma_end", str(stage3_gmm_sigma_end),
-        "--vis_depth_gate", str(stage3_vis_depth_gate)
+        "--vis_depth_gate", str(stage3_vis_depth_gate),
+        "--lambda_tan", str(stage3_lambda_tan),
+        "--lambda_tan_anchor", str(stage3_lambda_tan_anchor)
     ]
     if str(stage3_data_term) == "gmm" and str(stage3_gmm_center_mode) != "faces":
         cmd += ["--gmm_center_mode", str(stage3_gmm_center_mode)]
+    if bool(stage3_update_rot):
+        cmd += ["--update_rot"]
     if bool(stage3_debug):
         cmd += ["--debug", "--debug_every", str(int(stage3_debug_every))]
         if bool(stage3_debug_dump):
@@ -312,6 +317,9 @@ def main():
     parser.add_argument('--stage3_debug', action='store_true')
     parser.add_argument('--stage3_debug_every', type=int, default=25)
     parser.add_argument('--stage3_debug_dump', action='store_true')
+    parser.add_argument('--stage3_update_rot', action='store_true')
+    parser.add_argument('--stage3_lambda_tan', type=float, default=0.0)
+    parser.add_argument('--stage3_lambda_tan_anchor', type=float, default=0.0)
 
     args = parser.parse_args()
 
@@ -398,7 +406,7 @@ def main():
         if not stage1_npz: raise ValueError("Stage 1 result missing")
         if not depth_obs_path: raise ValueError("Depth obs missing")
 
-        noise_vert = 0.01 if args.perturb_vertices else 0.0
+        noise_vert = 0.04 if args.perturb_vertices else 0.0
         run_stage3(
             MESH_OBJ, stage1_npz, depth_obs_path, os.path.join(run_dir, "stage3"), noise_vert,
             stage3_data_term=args.stage3_data_term,
@@ -408,7 +416,10 @@ def main():
             stage3_vis_depth_gate=args.stage3_vis_depth_gate,
             stage3_debug=args.stage3_debug,
             stage3_debug_every=args.stage3_debug_every,
-            stage3_debug_dump=args.stage3_debug_dump
+            stage3_debug_dump=args.stage3_debug_dump,
+            stage3_update_rot=args.stage3_update_rot,
+            stage3_lambda_tan=args.stage3_lambda_tan,
+            stage3_lambda_tan_anchor=args.stage3_lambda_tan_anchor
         )
 
     print(f"=== Pipeline Finished | Results: {run_dir} ===")

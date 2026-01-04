@@ -82,6 +82,7 @@ def gmm_surface_nll(
     K: torch.Tensor,                           # (3,3)
     roi_xywh,
     depth_obs: torch.Tensor,                   # (H,W)
+    ellipsoid_rot_mats: torch.Tensor = None,      # (M,3,3) local->cam
     num_pix: int = 2048,
     max_ellipsoids: int = 5000,
     ellipsoid_log_scales: torch.Tensor = None, # (M,3) log(sx,sy,sz)
@@ -107,6 +108,9 @@ def gmm_surface_nll(
     logs = None
     if use_anisotropic and (ellipsoid_log_scales is not None):
         logs = ellipsoid_log_scales[mask]
+    rotm = None
+    if ellipsoid_rot_mats is not None:
+        rotm = ellipsoid_rot_mats[mask]
 
     # 2) subsample ellipsoids
     M = int(centers.shape[0])
@@ -115,6 +119,8 @@ def gmm_surface_nll(
         centers = centers[sel]
         if logs is not None:
             logs = logs[sel]
+        if rotm is not None:
+            rotm = rotm[sel]
         M = int(centers.shape[0])
 
     # 2.5) 可见性门控：单视角深度只约束前表面，过滤掉明显在观测深度后方的中心（避免背面吸附）
@@ -123,6 +129,8 @@ def gmm_surface_nll(
         centers = centers[mg]
         if logs is not None:
             logs = logs[mg]
+        if rotm is not None:
+            rotm = rotm[mg]
         if centers.numel() == 0:
             stats = {"num_centers": 0, "num_pix": 0, "num_t": 1}
             return torch.zeros([], device=device, requires_grad=True), stats
@@ -158,7 +166,12 @@ def gmm_surface_nll(
             ce = const[st:ed]                      # (m,)
 
             diff = X[:, None, :] - c[None, :, :]                 # (N,m,3)
-            quad = (diff * diff * inv[None, :, :]).sum(dim=2)    # (N,m)
+            if rotm is not None:
+                Rc = rotm[st:ed]                                  # (m,3,3) local->cam
+                diff_l = torch.einsum('nmi,mij->nmj', diff, Rc)    # (N,m,3) in local
+                quad = (diff_l * diff_l * inv[None, :, :]).sum(dim=2)
+            else:
+                quad = (diff * diff * inv[None, :, :]).sum(dim=2)
             log_phi = -0.5 * quad - ce[None, :]                  # (N,m)
 
             log_chunk = torch.logsumexp(log_phi, dim=1)          # (N,)

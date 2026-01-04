@@ -53,6 +53,7 @@ def ray_overlap_nll(
     learn_ellipsoid: bool = False,
     num_t: int = 5,
     vis_depth_gate: float = 0.0,
+    ellipsoid_rot_mats: torch.Tensor = None,  # (M,3,3) local->cam
 ):
     """
     概率射线重叠 NLL（像素采样版）
@@ -79,6 +80,9 @@ def ray_overlap_nll(
     logs = None
     if use_anisotropic and (ellipsoid_log_scales is not None):
         logs = ellipsoid_log_scales[m]
+    rotm = None
+    if ellipsoid_rot_mats is not None:
+        rotm = ellipsoid_rot_mats[m]
 
     # subsample ellipsoids（防止爆）
     if centers.shape[0] > max_ellipsoids:
@@ -86,6 +90,8 @@ def ray_overlap_nll(
         centers = centers[sel]
         if logs is not None:
             logs = logs[sel]
+        if rotm is not None:
+            rotm = rotm[sel]
 
     # 1.5) 可见性门控：单视角深度只约束前表面，过滤掉明显在观测深度后方的中心（避免背面吸附）
     if float(vis_depth_gate) > 0.0:
@@ -93,6 +99,8 @@ def ray_overlap_nll(
         centers = centers[mg]
         if logs is not None:
             logs = logs[mg]
+        if rotm is not None:
+            rotm = rotm[mg]
         if centers.shape[0] == 0:
             return torch.tensor(0.0, device=device, requires_grad=True), {"num_centers": 0, "num_pix": 0}
 
@@ -145,7 +153,11 @@ def ray_overlap_nll(
 
         def log_mix_at_x(x_t):
             diff = x_t[:, None, :] - C[None, :, :]                 # (N,M,3)
-            quad = (diff * diff * inv_s2[None, :, :]).sum(dim=2)   # (N,M)
+            if rotm is not None:
+                diff_l = torch.einsum('nmi,mij->nmj', diff, rotm)    # (N,M,3) in local
+                quad = (diff_l * diff_l * inv_s2[None, :, :]).sum(dim=2)
+            else:
+                quad = (diff * diff * inv_s2[None, :, :]).sum(dim=2)
             log_terms = -0.5 * quad                                # (N,M)
             return torch.logsumexp(log_terms, dim=1) - logM         # (N,)
 

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from stage1.camera import apply_rigid, project_points
+from stage1.camera import apply_rigid, project_points, axis_angle_to_matrix
 
 
 def _roi_mask_points_cam(points_cam: torch.Tensor, K: torch.Tensor, roi_xywh):
@@ -42,8 +42,10 @@ class GaussianSkinModel(nn.Module):
         max_ellipsoids: int = 5000,
         chunk_k: int = 1024,
         device: str = "cuda",
+        learn_rot: bool = False,
     ):
         super().__init__()
+        # 确保 base_verts 是 (N, 3)
         if init_vertices.dim() == 3 and init_vertices.shape[0] == 1:
             init_vertices = init_vertices[0]
 
@@ -64,19 +66,29 @@ class GaussianSkinModel(nn.Module):
             if roi_v_idx_override is not None:
                 roi_v_idx = roi_v_idx_override.detach().to(device).long()
             else:
-                v_cam0 = apply_rigid(self.base_verts, self.rot0, self.trans0)
+                # [FIXED] rot0 -> rot, trans0 -> trans
+                v_cam0 = apply_rigid(self.base_verts, self.rot, self.trans)
+                # 确保降维 (1, N, 3) -> (N, 3)
+                if v_cam0.dim() == 3 and v_cam0.shape[0] == 1:
+                    v_cam0 = v_cam0[0]
+
                 vmask = _roi_mask_points_cam(v_cam0, self.K, self.roi_xywh)
                 roi_v_idx = torch.where(vmask)[0].long()
                 if roi_v_idx.numel() == 0:
                     roi_v_idx = torch.arange(self.base_verts.shape[0], device=device).long()
             self.register_buffer("roi_v_idx", roi_v_idx)
 
-# ---- 固定 ROI faces 子集（用 base 投影选一次） ----
+        # ---- 固定 ROI faces 子集（用 base 投影选一次） ----
         with torch.no_grad():
             if roi_f_idx_override is not None:
                 roi_f_idx = roi_f_idx_override.detach().to(device).long()
             else:
-                v_cam0 = apply_rigid(self.base_verts, self.rot0, self.trans0)
+                # [FIXED] rot0 -> rot, trans0 -> trans
+                v_cam0 = apply_rigid(self.base_verts, self.rot, self.trans)
+                # [CRITICAL FIX] 必须降维 (N, 3)，否则 v_cam0[self.faces] 会在 dim0 上越界
+                if v_cam0.dim() == 3 and v_cam0.shape[0] == 1:
+                    v_cam0 = v_cam0[0]
+
                 f = self.faces
                 tri0 = v_cam0[f]  # (F,3,3) in cam
                 c0_cam = tri0.mean(dim=1)  # (F,3)
@@ -108,6 +120,10 @@ class GaussianSkinModel(nn.Module):
         # ---- 可学习参数：d_k 仅作位移基元，不再直接改中心 ----
         self.ellipsoid_disp = nn.Parameter(torch.zeros((K_ell, 3), device=device))       # d_k
         self.ellipsoid_shape_raw = nn.Parameter(torch.zeros((K_ell, 3), device=device)) # shape
+        self.ellipsoid_rotvec = nn.Parameter(
+            torch.zeros((K_ell, 3), device=device),
+            requires_grad=bool(learn_rot)
+        )
 
         self._last_centers_world = None
 
@@ -129,6 +145,16 @@ class GaussianSkinModel(nn.Module):
             vertices_world = vertices_world[0]
         tri = vertices_world[self.roi_faces]      # (K,3,3)
         return tri.mean(dim=1)                    # (K,3)
+
+    def ellipsoid_rot_mats_world(self):
+        # local -> world
+        return axis_angle_to_matrix(self.ellipsoid_rotvec)
+
+    def ellipsoid_rot_mats_cam(self):
+        # local -> cam : R_wc @ R_lw
+        R_wc = axis_angle_to_matrix(self.rot.reshape(1, 3))[0]  # (3,3)
+        R_lw = self.ellipsoid_rot_mats_world()                  # (K,3,3)
+        return torch.einsum('ij,kjl->kil', R_wc, R_lw)
 
     def ellipsoid_centers_cam(self, vertices_world: torch.Tensor = None):
         c_world = self.ellipsoid_centers_world(vertices_world)
@@ -170,7 +196,9 @@ class GaussianSkinModel(nn.Module):
             invc = inv_s2[s:e]      # (kc,3)
 
             diff = V_roi[:, None, :] - Cc[None, :, :]                 # (M,kc,3)
-            quad = (diff * diff * invc[None, :, :]).sum(dim=2)        # (M,kc)
+            Rw = axis_angle_to_matrix(self.ellipsoid_rotvec[s:e])     # (kc,3,3) local->world
+            diff_l = torch.einsum('mki,kij->mkj', diff, Rw)            # (M,kc,3) in local
+            quad = (diff_l * diff_l * invc[None, :, :]).sum(dim=2)     # (M,kc)
             w = torch.exp(-0.5 * quad)                                # (M,kc)
             max_w = torch.maximum(max_w, w.max(dim=1).values)
             sum_w2 = sum_w2 + (w * w).sum(dim=1)
@@ -216,6 +244,7 @@ class GaussianSkinModelVertexGMM(nn.Module):
         max_ellipsoids: int = 5000,
         chunk_k: int = 1024,
         device: str = "cuda",
+        learn_rot: bool = False,
     ):
         super().__init__()
         if init_vertices.dim() == 3 and init_vertices.shape[0] == 1:
@@ -237,7 +266,11 @@ class GaussianSkinModelVertexGMM(nn.Module):
             if roi_v_idx_override is not None:
                 roi_v_idx = roi_v_idx_override.detach().to(device).long()
             else:
+                # [Fix Here]: rot0 -> rot, trans0 -> trans
                 v_cam0 = apply_rigid(self.base_verts, self.rot, self.trans)
+                if v_cam0.dim() == 3 and v_cam0.shape[0] == 1:
+                    v_cam0 = v_cam0[0]
+                
                 vmask = _roi_mask_points_cam(v_cam0, self.K, self.roi_xywh)
                 roi_v_idx = torch.where(vmask)[0].long()
                 if roi_v_idx.numel() == 0:
@@ -250,6 +283,11 @@ class GaussianSkinModelVertexGMM(nn.Module):
         M = int(self.roi_v_idx.numel())
         self.ellipsoid_disp = nn.Parameter(torch.zeros((M, 3), device=device))
         self.ellipsoid_shape_raw = nn.Parameter(torch.zeros((M, 3), device=device))
+
+        self.ellipsoid_rotvec = nn.Parameter(
+            torch.zeros((M, 3), device=device),
+            requires_grad=bool(learn_rot)
+        )
         self._last_centers_world = None
 
     def shape_l(self):
@@ -265,6 +303,14 @@ class GaussianSkinModelVertexGMM(nn.Module):
         if vertices_world.dim() == 3 and vertices_world.shape[0] == 1:
             vertices_world = vertices_world[0]
         return vertices_world[self.roi_v_idx]
+
+    def ellipsoid_rot_mats_world(self):
+        return axis_angle_to_matrix(self.ellipsoid_rotvec)
+
+    def ellipsoid_rot_mats_cam(self):
+        R_wc = axis_angle_to_matrix(self.rot.reshape(1, 3))[0]
+        R_lw = self.ellipsoid_rot_mats_world()
+        return torch.einsum('ij,kjl->kil', R_wc, R_lw)
 
     def ellipsoid_centers_cam(self, vertices_world: torch.Tensor = None):
         c_world = self.ellipsoid_centers_world(vertices_world)

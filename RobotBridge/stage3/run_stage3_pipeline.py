@@ -40,6 +40,8 @@ def main():
 
     ap.add_argument("--lambda_disp", type=float, default=10.0)
     ap.add_argument("--lambda_shape", type=float, default=0.1)
+    ap.add_argument("--lambda_tan", type=float, default=0.0)
+    ap.add_argument("--lambda_tan_anchor", type=float, default=0.0)
 
     ap.add_argument("--no_report_metrics", action="store_true")
 
@@ -49,6 +51,8 @@ def main():
     ap.add_argument("--gmm_sigma_end", type=float, default=0.005)
 
     ap.add_argument("--gmm_center_mode", type=str, default="faces", choices=["faces", "verts"])
+
+    ap.add_argument("--update_rot", action="store_true")
 
     ap.add_argument("--vis_depth_gate", type=float, default=-1.0)
     ap.add_argument("--debug", action="store_true")
@@ -97,8 +101,11 @@ def main():
 
     v_init = v_gt.clone()
     if args.init_noise_std > 0:
-        idx = torch.arange(0, v_init.shape[0], 2, device=v_init.device)
-        v_init[idx] += torch.randn_like(v_init[idx]) * float(args.init_noise_std)
+        # idx = torch.arange(0, v_init.shape[0], 2, device=v_init.device)
+        # v_init[idx] += torch.randn_like(v_init[idx]) * float(args.init_noise_std)
+
+        # 修改示例：给所有顶点加噪
+        v_init += torch.randn_like(v_init) * float(args.init_noise_std)
 
     # ==========================================================
     # 3. 核心逻辑：静态筛选与门控解耦
@@ -203,7 +210,42 @@ def main():
         max_ellipsoids=int(args.max_ellipsoids),
         chunk_k=1024,
         device=str(device),
+        learn_rot=bool(args.update_rot),
     ).to(device)
+
+    tan_edges = None
+    tan_normals = None
+    if is_gmm_vertex and float(args.lambda_tan) > 0.0:
+        with torch.no_grad():
+            roi_v = model.roi_v_idx
+            nV = int(model.base_verts.shape[0])
+
+            roi_mask = torch.zeros((nV,), device=device, dtype=torch.bool)
+            roi_mask[roi_v] = True
+
+            f = faces_gpu
+            edges = torch.cat([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], dim=0)
+            edges = torch.sort(edges, dim=1).values
+            edges = torch.unique(edges, dim=0)
+            edges = edges[roi_mask[edges[:, 0]] & roi_mask[edges[:, 1]]]
+
+            mapping = torch.full((nV,), -1, device=device, dtype=torch.long)
+            mapping[roi_v] = torch.arange(roi_v.numel(), device=device)
+            tan_edges = mapping[edges]  # (E,2) ROI-local
+
+            V0 = model.base_verts
+            v0 = V0[f[:, 0]]
+            v1 = V0[f[:, 1]]
+            v2 = V0[f[:, 2]]
+            fn = torch.cross(v1 - v0, v2 - v0, dim=1)
+
+            vn = torch.zeros_like(V0)
+            vn.index_add_(0, f[:, 0], fn)
+            vn.index_add_(0, f[:, 1], fn)
+            vn.index_add_(0, f[:, 2], fn)
+            vn = vn / (vn.norm(dim=1, keepdim=True) + 1e-12)
+
+            tan_normals = vn[roi_v]  # (M,3)
 
     ell_count = int(model.roi_v_idx.numel()) if is_gmm_vertex else int(model.roi_faces.shape[0])
 
@@ -211,6 +253,9 @@ def main():
         {"params": [model.ellipsoid_disp], "lr": float(args.lr)},
         {"params": [model.ellipsoid_shape_raw], "lr": float(args.lr) * 0.2},
     ])
+
+    if bool(args.update_rot):
+        optimizer.add_param_group({"params": [model.ellipsoid_rotvec], "lr": float(args.lr) * 0.1})
 
     roi_dev_start = float("nan")
     roi_dev_end = float("nan")
@@ -233,6 +278,7 @@ def main():
 
         c_start_cam = model.ellipsoid_centers_cam(v_start)
         log_s_start = model.ellipsoid_log_scales()
+        rot_mats_start = model.ellipsoid_rot_mats_cam()
 
         vis_all_ell = int(ell_count)
 
@@ -244,6 +290,7 @@ def main():
             roi_xywh=roi_xywh,
             centers_pred=c_start_cam,
             ellipsoid_log_scales=log_s_start,
+            ellipsoid_rot_mats=rot_mats_start,
             out_ply=os.path.join(dir_vis_3d_comp, "roi_START.ply"),
             max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
@@ -259,6 +306,7 @@ def main():
         save_roi_ellipsoids_only_ply(
             centers_pred=c_start_cam,
             ellipsoid_log_scales=log_s_start,
+            ellipsoid_rot_mats=rot_mats_start,
             K=K,
             roi_xywh=roi_xywh,
             out_ply=os.path.join(dir_vis_3d, "roi_ell_START.ply"),
@@ -276,6 +324,7 @@ def main():
             v_gt_cam=v_gt_cam,
             centers_cam=c_start_cam,
             ellipsoid_log_scales=log_s_start,
+            ellipsoid_rot_mats=rot_mats_start,
             K=K,
             roi_xywh=roi_xywh,
             roi_wh=roi_wh,
@@ -399,6 +448,8 @@ def main():
         centers_cam = model.ellipsoid_centers_cam(v_def)
         log_scales = model.ellipsoid_log_scales()
 
+        rot_mats_cam = model.ellipsoid_rot_mats_cam()
+
         if args.data_term == "ray":
             loss_nll, stats = ray_overlap_nll(
                 centers_cam=centers_cam,
@@ -414,6 +465,7 @@ def main():
                 learn_ellipsoid=True,
                 num_t=int(args.num_t),
                 vis_depth_gate=float(runtime_vis_gate),
+                ellipsoid_rot_mats=rot_mats_cam,
             )
         else:
             if int(args.epochs) <= 1:
@@ -436,6 +488,7 @@ def main():
                 use_anisotropic=True,
                 sigma_mult=float(curr_sigma),
                 vis_depth_gate=float(runtime_vis_gate),
+                ellipsoid_rot_mats=rot_mats_cam,
             )
             stats["sigma_mult"] = float(curr_sigma)
 
@@ -443,7 +496,26 @@ def main():
         l = model.shape_l()
         loss_shape_reg = (l ** 2).mean() * float(args.lambda_shape)
 
-        loss = loss_nll + loss_disp_reg + loss_shape_reg
+        loss_tan_reg = torch.tensor(0.0, device=loss_nll.device)
+        if tan_edges is not None:
+            e0 = tan_edges[:, 0]
+            e1 = tan_edges[:, 1]
+            di = model.ellipsoid_disp[e0]
+            dj = model.ellipsoid_disp[e1]
+            dd = di - dj
+
+            ni = tan_normals[e0]
+            nj = tan_normals[e1]
+            proj_i = dd - (dd * ni).sum(dim=1, keepdim=True) * ni
+            proj_j = dd - (dd * nj).sum(dim=1, keepdim=True) * nj
+
+            loss_tan_reg = (proj_i.pow(2).sum(dim=1) + proj_j.pow(2).sum(dim=1)).mean() * float(args.lambda_tan)
+
+            if float(args.lambda_tan_anchor) > 0.0:
+                dt = model.ellipsoid_disp - (model.ellipsoid_disp * tan_normals).sum(dim=1, keepdim=True) * tan_normals
+                loss_tan_reg = loss_tan_reg + dt.mean(dim=0).pow(2).sum() * float(args.lambda_tan_anchor)
+
+        loss = loss_nll + loss_disp_reg + loss_shape_reg + loss_tan_reg
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
@@ -514,6 +586,7 @@ def main():
                     gate_z=gate_z.detach().cpu().numpy(),
                     rz=rz.detach().cpu().numpy(),
                     rt=rt.detach().cpu().numpy(),
+                    loss_tan=float(loss_tan_reg.detach().item()),
                 )
 
             print(
@@ -522,13 +595,13 @@ def main():
                 f"rt(mean/p90/max)={rt_s['mean']:.4f}/{rt_s['p90']:.4f}/{rt_s['max']:.4f} | "
                 f"dv(p95/max)={dv_s['p95']:.4f}/{dv_s['max']:.4f} dz_abs(p95/max)={dz_s['p95']:.4f}/{dz_s['max']:.4f} | "
                 f"logS[{logS_min:.2f},{logS_max:.2f}] sum_w(p50/min)={sumw_p50:.2e}/{sumw_min:.2e} effK={effk_mean:.2f} | "
-                f"gdisp={gdisp:.2e} gshape={gshape:.2e}"
+                f"gdisp={gdisp:.2e} gshape={gshape:.2e} tan={float(loss_tan_reg.detach().item()):.3e}"
             )
 
         if (it % 50 == 0) or (it == 1) or (it == int(args.epochs)):
             sigma_info = f"sigma={stats['sigma_mult']:.4f}" if 'sigma_mult' in stats else f"t={stats['num_t']}"
             print(
-                f"[Stage3][{it:03d}/{int(args.epochs)}] L={loss.item():.5f} (NLL={loss_nll.item():.5f}, disp={loss_disp_reg.item():.5f}, shape={loss_shape_reg.item():.5f}) "
+                f"[Stage3][{it:03d}/{int(args.epochs)}] L={loss.item():.5f} (NLL={loss_nll.item():.5f}, disp={loss_disp_reg.item():.5f}, shape={loss_shape_reg.item():.5f}, tan={float(loss_tan_reg.detach().item()):.3e}) "
                 f"[centers={stats['num_centers']} pix={stats['num_pix']} {sigma_info}]"
             )
 
@@ -556,6 +629,7 @@ def main():
 
         c_end_cam = model.ellipsoid_centers_cam(v_end)
         log_s_end = model.ellipsoid_log_scales()
+        rot_mats_end = model.ellipsoid_rot_mats_cam()
 
         vis_all_ell = int(ell_count)
 
@@ -568,6 +642,7 @@ def main():
             roi_xywh=roi_xywh,
             centers_pred=c_end_cam,
             ellipsoid_log_scales=log_s_end,
+            ellipsoid_rot_mats=rot_mats_end,
             out_ply=os.path.join(dir_vis_3d_comp, "roi_END.ply"),
             max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
@@ -583,6 +658,7 @@ def main():
         save_roi_ellipsoids_only_ply(
             centers_pred=c_end_cam,
             ellipsoid_log_scales=log_s_end,
+            ellipsoid_rot_mats=rot_mats_end,
             K=K,
             roi_xywh=roi_xywh,
             out_ply=os.path.join(dir_vis_3d, "roi_ell_END.ply"),
@@ -598,6 +674,7 @@ def main():
             roi_xywh=roi_xywh,
             centers_pred=c_end_cam,
             ellipsoid_log_scales=log_s_end,
+            ellipsoid_rot_mats=rot_mats_end,
             out_ply=os.path.join(dir_vis_3d_comp, "roi_pred_only_END.ply"),
             max_ellipsoids=vis_all_ell,
             ellipsoid_level=1,
@@ -607,6 +684,7 @@ def main():
             v_gt_cam=v_gt_cam,
             centers_cam=c_end_cam,
             ellipsoid_log_scales=log_s_end,
+            ellipsoid_rot_mats=rot_mats_end,
             K=K,
             roi_xywh=roi_xywh,
             roi_wh=roi_wh,
@@ -624,6 +702,7 @@ def main():
 
     np.save(os.path.join(args.out_dir, "displacement_opt.npy"), model.ellipsoid_disp.detach().cpu().numpy())
     np.save(os.path.join(args.out_dir, "shape_opt.npy"), model.ellipsoid_shape_raw.detach().cpu().numpy())
+    np.save(os.path.join(args.out_dir, "rot_opt.npy"), model.ellipsoid_rotvec.detach().cpu().numpy())
     np.save(os.path.join(args.out_dir, "stage3_meta.npy"), {
         "roi_v_idx": model.roi_v_idx.detach().cpu().numpy(),
         "roi_f_idx": model.roi_f_idx.detach().cpu().numpy(),

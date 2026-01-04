@@ -221,6 +221,7 @@ def save_roi_mesh_ellipsoids_ply(
     centers_pred: torch.Tensor,
     ellipsoid_log_scales: torch.Tensor,
     out_ply: str,
+    ellipsoid_rot_mats: torch.Tensor = None,
     max_ellipsoids: int = 400,
     ellipsoid_level: int = 1
 ):
@@ -245,19 +246,23 @@ def save_roi_mesh_ellipsoids_ply(
     # 椭球（来自 pred）
     cp = centers_pred.detach()
     sp = ellipsoid_log_scales.detach()
+    Rp = ellipsoid_rot_mats.detach() if ellipsoid_rot_mats is not None else None
+    Rp = ellipsoid_rot_mats.detach() if ellipsoid_rot_mats is not None else None
 
     mpc = _roi_mask_vertices(cp, K, roi_xywh)
     cp = cp[mpc]
     sp = sp[mpc]
+    if Rp is not None:
+        Rp = Rp[mpc]
 
-    def subsample_pair(C, S):
+    def subsample_pair(C, S, R):
         n = int(C.shape[0])
         if n <= max_ellipsoids:
-            return C, S
+            return C, S, R
         idx = torch.linspace(0, n - 1, steps=max_ellipsoids).long().to(C.device)
-        return C[idx], S[idx]
+        return C[idx], S[idx], (R[idx] if R is not None else None)
 
-    cp, sp = subsample_pair(cp, sp)
+    cp, sp, Rp = subsample_pair(cp, sp, Rp)
     cp_np = cp.cpu().numpy()
     scales_np = torch.exp(sp).cpu().numpy()  # (M,3)
 
@@ -286,8 +291,12 @@ def save_roi_mesh_ellipsoids_ply(
 
     # ellipsoids (red)
     offset_e = offset_pr + Vp.shape[0]
-    for c, s in zip(cp_np, scales_np):
-        v_e = EV * s[None, :] + c[None, :]
+    Rp_np = Rp.cpu().numpy() if Rp is not None else None
+    for ii, (c, s_) in enumerate(zip(cp_np, scales_np)):
+        v_local = EV * s_[None, :]
+        if Rp_np is not None:
+            v_local = v_local @ Rp_np[ii].T
+        v_e = v_local + c[None, :]
         verts.append(v_e)
         colors.append(np.tile(np.array([[255, 0, 0]], dtype=np.uint8), (v_e.shape[0], 1)))
         for tri in EF:
@@ -321,6 +330,7 @@ def save_roi_pred_ellipsoids_only_ply(
     centers_pred: torch.Tensor,
     ellipsoid_log_scales: torch.Tensor,
     out_ply: str,
+    ellipsoid_rot_mats: torch.Tensor = None,
     max_ellipsoids: int = 400,
     ellipsoid_level: int = 1
 ):
@@ -335,15 +345,16 @@ def save_roi_pred_ellipsoids_only_ply(
     fp_np = fp.detach().cpu().numpy().astype(np.int32)
     cp = centers_pred.detach()
     sp = ellipsoid_log_scales.detach()
+    Rp = ellipsoid_rot_mats.detach() if ellipsoid_rot_mats is not None else None
     mpc = _roi_mask_vertices(cp, K, roi_xywh)
     cp = cp[mpc]
     sp = sp[mpc]
-    def subsample_pair(C, S):
+    def subsample_pair(C, S, R):
         n = int(C.shape[0])
-        if n <= max_ellipsoids: return C, S
+        if n <= max_ellipsoids: return C, S, R
         idx = torch.linspace(0, n - 1, steps=max_ellipsoids).long().to(C.device)
-        return C[idx], S[idx]
-    cp, sp = subsample_pair(cp, sp)
+        return C[idx], S[idx], (R[idx] if R is not None else None)
+    cp, sp, Rp = subsample_pair(cp, sp, Rp)
     cp_np = cp.cpu().numpy()
     scales_np = torch.exp(sp).cpu().numpy()
     EV, EF = _icosphere(level=ellipsoid_level)
@@ -356,8 +367,12 @@ def save_roi_pred_ellipsoids_only_ply(
     for tri in fp_np:
         faces_out.append([tri[0] + offset_pr, tri[1] + offset_pr, tri[2] + offset_pr])
     offset_e = offset_pr + Vp.shape[0]
-    for c, s in zip(cp_np, scales_np):
-        v_e = EV * s[None, :] + c[None, :]
+    Rp_np = Rp.cpu().numpy() if Rp is not None else None
+    for ii, (c, s_) in enumerate(zip(cp_np, scales_np)):
+        v_local = EV * s_[None, :]
+        if Rp_np is not None:
+            v_local = v_local @ Rp_np[ii].T
+        v_e = v_local + c[None, :]
         verts.append(v_e)
         colors.append(np.tile(np.array([[255, 0, 0]], dtype=np.uint8), (v_e.shape[0], 1)))
         for tri in EF:
@@ -446,6 +461,7 @@ def save_roi_ellipsoids_only_ply(
     K: torch.Tensor,
     roi_xywh,
     out_ply: str,
+    ellipsoid_rot_mats: torch.Tensor = None,
     max_ellipsoids: int = 400,
     ellipsoid_level: int = 1,
     rgb=(255, 0, 0),
@@ -457,10 +473,14 @@ def save_roi_ellipsoids_only_ply(
 
     cp = centers_pred.detach()
     sp = ellipsoid_log_scales.detach()
+    Rp = ellipsoid_rot_mats.detach() if ellipsoid_rot_mats is not None else None
+    Rp = ellipsoid_rot_mats.detach() if ellipsoid_rot_mats is not None else None
 
     mpc = _roi_mask_vertices(cp, K, roi_xywh)
     cp = cp[mpc]
     sp = sp[mpc]
+    if Rp is not None:
+        Rp = Rp[mpc]
 
     n = int(cp.shape[0])
     if n > max_ellipsoids:
@@ -479,8 +499,12 @@ def save_roi_ellipsoids_only_ply(
     faces_out = []
 
     offset = 0
-    for c, s in zip(cp_np, scales_np):
-        v_e = EV * s[None, :] + c[None, :]
+    Rp_np = Rp.cpu().numpy() if Rp is not None else None
+    for ii, (c, s_) in enumerate(zip(cp_np, scales_np)):
+        v_local = EV * s_[None, :]
+        if Rp_np is not None:
+            v_local = v_local @ Rp_np[ii].T
+        v_e = v_local + c[None, :]
         verts.append(v_e)
         for tri in EF:
             faces_out.append([tri[0] + offset, tri[1] + offset, tri[2] + offset])

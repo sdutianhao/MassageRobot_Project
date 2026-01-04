@@ -32,6 +32,7 @@ def save_roi_overlay_png(
     K: torch.Tensor,
     roi_xywh: list,
     out_png: str,
+    ellipsoid_rot_mats: torch.Tensor = None,
     title: str = ""
 ):
     """
@@ -88,6 +89,7 @@ def save_overlay_ellipsoids_gt_png(
     roi_xywh: list,
     roi_wh,
     out_png: str,
+    ellipsoid_rot_mats: torch.Tensor = None,
     title: str = "",
     max_gt_points: int = 20000,
     max_ellipsoids: int = None,
