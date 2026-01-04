@@ -202,8 +202,7 @@ $$
 \left(
 \frac{1}{K}
 \sum_{k=1}^{K}
-\exp
-!\left(
+\exp!\left(
 -\tfrac12
 ,
 |x(u,v)-\mu_k|^2_{\Sigma_k^{-1}}
@@ -225,7 +224,7 @@ $$
 
 ### 6.2 正则项
 
-**顶点位移正则：**
+#### 顶点位移正则
 
 $$
 \mathcal L_{\text{disp}}
@@ -240,7 +239,7 @@ $$
 
 ---
 
-**椭球形状正则（体积保持）：**
+#### 椭球形状正则（体积保持）
 
 $$
 \tilde\ell_i
@@ -249,7 +248,8 @@ $$
 ## \ell_i
 
 \frac{1}{3}
-\sum_{j=1}^{3}\ell_{ij}
+\sum_{j=1}^{3}
+\ell_{ij}
 $$
 
 $$
@@ -265,7 +265,7 @@ $$
 
 ---
 
-**切向正则：**
+#### 切向正则
 
 $$
 \mathcal L_{\text{tan}}
@@ -273,19 +273,19 @@ $$
 
 \frac{1}{|\mathcal E|}
 \sum_{(i,j)\in\mathcal E}
-|
+\left|
 (d_i-d_j)
 ---------
 
-((d_i-d_j)^\top n_i)n_i
-|^2
+\big((d_i-d_j)^\top n_i\big)n_i
+\right|^2
 $$
 
 目的：抑制切向高频漂移。
 
 ---
 
-**切向锚定项：**
+#### 切向锚定项
 
 $$
 \mathcal L_{\text{tan-anchor}}
