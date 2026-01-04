@@ -173,50 +173,21 @@ Stage3 将 ROI 内的皮肤顶点视为 **高斯混合模型（GMM）分量中�
 
 Stage3 的总损失函数定义为：
 
-$$
-\mathcal L
-==========
-
-\mathcal L_{\text{GMM}}
-+
-\lambda_{\text{disp}} \mathcal L_{\text{disp}}
-+
-\lambda_{\text{shape}} \mathcal L_{\text{shape}}
-+
-\lambda_{\text{tan}} \mathcal L_{\text{tan}}
-+
-\lambda_{\text{tan-anchor}} \mathcal L_{\text{tan-anchor}}
-$$
+$$\mathcal L=\mathcal L_{\text{GMM}}+\lambda_{\text{disp}}\mathcal L_{\text{disp}}+\lambda_{\text{shape}}\mathcal L_{\text{shape}}+\lambda_{\text{tan}}\mathcal L_{\text{tan}}+\lambda_{\text{tan-anchor}}\mathcal L_{\text{tan-anchor}}$$
 
 ---
 
 ### 6.1 GMM 表面深度似然（Data Term）
 
-$$
-\mathcal L_{\text{GMM}}
-=======================
-
--\frac{1}{|\mathcal P|}
-\sum_{(u,v)\in\mathcal P}
-\log
-\left(
-\frac{1}{K}
-\sum_{k=1}^{K}
-\exp!\left(
--\tfrac12
-,
-|x(u,v)-\mu_k|^2_{\Sigma_k^{-1}}
-\right)
-\right)
-$$
+$$\mathcal L_{\text{GMM}}=-\frac{1}{|\mathcal P|}\sum_{(u,v)\in\mathcal P}\log\left(\frac{1}{K}\sum_{k=1}^{K}\exp!\left(-\tfrac12|x(u,v)-\mu_k|^2_{\Sigma_k^{-1}}\right)\right)$$
 
 **符号说明：**
 
-* ( \mathcal P )：ROI 深度图中采样的有效像素集合
-* ( x(u,v) )：由像素 ((u,v)) 与观测深度反投影得到的 3D 点
-* ( K )：GMM 分量数量（等于 ROI 顶点数）
-* ( \mu_k )：第 (k) 个 GMM 分量中心（ROI 顶点）
-* ( \Sigma_k )：对应的各向异性协方差矩阵
+* $(\mathcal P)$：ROI 深度图中采样的有效像素集合
+* $(x(u,v))$：由像素 $(u,v)$ 与观测深度反投影得到的 3D 点
+* $(K)$：GMM 分量数量（等于 ROI 顶点数）
+* $(\mu_k)$：第 $k$ 个 GMM 分量中心（ROI 顶点）
+* $(\Sigma_k)$：对应的各向异性协方差矩阵
 
 该项是唯一的数据一致性约束。
 
@@ -226,14 +197,7 @@ $$
 
 #### 顶点位移正则
 
-$$
-\mathcal L_{\text{disp}}
-========================
-
-\frac{1}{N}
-\sum_{i=1}^{N}
-|d_i|^2
-$$
+$$\mathcal L_{\text{disp}}=\frac{1}{N}\sum_{i=1}^{N}|d_i|^2$$
 
 目的：抑制过大的局部位移。
 
@@ -241,25 +205,9 @@ $$
 
 #### 椭球形状正则（体积保持）
 
-$$
-\tilde\ell_i
-============
+$$\tilde\ell_i=\ell_i-\frac{1}{3}\sum_{j=1}^{3}\ell_{ij}$$
 
-## \ell_i
-
-\frac{1}{3}
-\sum_{j=1}^{3}
-\ell_{ij}
-$$
-
-$$
-\mathcal L_{\text{shape}}
-=========================
-
-\frac{1}{N}
-\sum_{i=1}^{N}
-|\tilde\ell_i|^2
-$$
+$$\mathcal L_{\text{shape}}=\frac{1}{N}\sum_{i=1}^{N}|\tilde\ell_i|^2$$
 
 目的：允许各向异性，同时保持总体体积稳定。
 
@@ -267,19 +215,7 @@ $$
 
 #### 切向正则
 
-$$
-\mathcal L_{\text{tan}}
-=======================
-
-\frac{1}{|\mathcal E|}
-\sum_{(i,j)\in\mathcal E}
-\left|
-(d_i-d_j)
----------
-
-\big((d_i-d_j)^\top n_i\big)n_i
-\right|^2
-$$
+$$\mathcal L_{\text{tan}}=\frac{1}{|\mathcal E|}\sum_{(i,j)\in\mathcal E}\left|(d_i-d_j)-\big((d_i-d_j)^\top n_i\big)n_i\right|^2$$
 
 目的：抑制切向高频漂移。
 
@@ -287,16 +223,7 @@ $$
 
 #### 切向锚定项
 
-$$
-\mathcal L_{\text{tan-anchor}}
-==============================
-
-\left|
-\frac{1}{N}
-\sum_{i=1}^{N}
-\big(d_i-(d_i^\top n_i)n_i\big)
-\right|^2
-$$
+$$\mathcal L_{\text{tan-anchor}}=\left|\frac{1}{N}\sum_{i=1}^{N}\big(d_i-(d_i^\top n_i)n_i\big)\right|^2$$
 
 目的：防止 ROI 整体沿切向发生一致性平移。
 
