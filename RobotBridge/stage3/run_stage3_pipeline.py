@@ -517,6 +517,7 @@ def main():
 
         loss = loss_nll + loss_disp_reg + loss_shape_reg + loss_tan_reg
         loss.backward()
+        gdisp_raw = float(model.ellipsoid_disp.grad.norm().item()) if model.ellipsoid_disp.grad is not None else 0.0
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
 
@@ -595,7 +596,7 @@ def main():
                 f"rt(mean/p90/max)={rt_s['mean']:.4f}/{rt_s['p90']:.4f}/{rt_s['max']:.4f} | "
                 f"dv(p95/max)={dv_s['p95']:.4f}/{dv_s['max']:.4f} dz_abs(p95/max)={dz_s['p95']:.4f}/{dz_s['max']:.4f} | "
                 f"logS[{logS_min:.2f},{logS_max:.2f}] sum_w(p50/min)={sumw_p50:.2e}/{sumw_min:.2e} effK={effk_mean:.2f} | "
-                f"gdisp={gdisp:.2e} gshape={gshape:.2e} tan={float(loss_tan_reg.detach().item()):.3e}"
+                f"gdisp_raw={gdisp_raw:.2e} gdisp={gdisp:.2e} gshape={gshape:.2e} tan={float(loss_tan_reg.detach().item()):.3e}"
             )
 
         if (it % 50 == 0) or (it == 1) or (it == int(args.epochs)):
