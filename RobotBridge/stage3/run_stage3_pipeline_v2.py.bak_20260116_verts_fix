@@ -1,0 +1,571 @@
+import os
+import sys
+import argparse
+import numpy as np
+import torch
+import torch.optim as optim
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from stage1.camera import apply_rigid, project_points
+from stage1.render_depth import render_gaussian_depth
+from stage2.skel_adapter import SkelAdapter
+from stage2.optim_theta import save_comparison_ply  # keep for parity with stage3
+
+from utils.vis import save_depth_vis
+from utils.ray_likelihood import ray_overlap_nll
+from utils.gmm_likelihood import gmm_surface_nll
+from utils.ply_vis import (
+    save_roi_mesh_ellipsoids_ply,
+    save_roi_pred_ellipsoids_only_ply,
+    save_mesh_only_ply,
+    save_roi_pred_mesh_only_ply,
+    save_roi_ellipsoids_only_ply,
+)
+from utils.metrics import mean_vertex_deviation
+from utils.vis_roi import save_overlay_ellipsoids_gt_png
+
+from stage3.gaussian_adapter import GaussianSkinModel, GaussianSkinModelVertexGMM
+
+
+def _build_roi_edges_from_faces(faces_cpu: np.ndarray, roi_v_idx: torch.Tensor, n_verts: int, device: torch.device):
+    """Return (e0_local, e1_local) for ROI vertex graph edges.
+
+    - faces_cpu: (F,3) int
+    - roi_v_idx: (M,) global vertex indices
+
+    Only unique undirected edges where BOTH endpoints are in ROI.
+    """
+    if roi_v_idx.numel() == 0:
+        return None
+
+    roi_v_idx = roi_v_idx.detach().to(device).long()
+    in_roi = torch.zeros((n_verts,), device=device, dtype=torch.bool)
+    in_roi[roi_v_idx] = True
+
+    # global->local map
+    g2l = torch.full((n_verts,), -1, device=device, dtype=torch.long)
+    g2l[roi_v_idx] = torch.arange(roi_v_idx.numel(), device=device, dtype=torch.long)
+
+    edges = set()
+    for (a, b, c) in faces_cpu.tolist():
+        if in_roi[a].item() and in_roi[b].item():
+            i, j = (a, b) if a < b else (b, a)
+            edges.add((i, j))
+        if in_roi[b].item() and in_roi[c].item():
+            i, j = (b, c) if b < c else (c, b)
+            edges.add((i, j))
+        if in_roi[c].item() and in_roi[a].item():
+            i, j = (c, a) if c < a else (a, c)
+            edges.add((i, j))
+
+    if len(edges) == 0:
+        return None
+
+    e0g = torch.tensor([i for (i, _) in edges], device=device, dtype=torch.long)
+    e1g = torch.tensor([j for (_, j) in edges], device=device, dtype=torch.long)
+
+    e0l = g2l[e0g]
+    e1l = g2l[e1g]
+    valid = (e0l >= 0) & (e1l >= 0) & (e0l != e1l)
+    e0l = e0l[valid]
+    e1l = e1l[valid]
+    if e0l.numel() == 0:
+        return None
+    return (e0l, e1l)
+
+
+def _grad_diffuse_vertex_grads(g: torch.Tensor, e0: torch.Tensor, e1: torch.Tensor, alpha: float):
+    """One diffusion step on vertex gradients along edges.
+
+    g: (M,3), e0/e1: (E,), local vertex indices.
+    """
+    if g is None or e0 is None or e1 is None:
+        return
+    if g.numel() == 0 or e0.numel() == 0:
+        return
+    M = g.shape[0]
+    dev = g.device
+
+    acc = torch.zeros((M, 3), device=dev, dtype=g.dtype)
+    cnt = torch.zeros((M, 1), device=dev, dtype=g.dtype)
+
+    acc.index_add_(0, e0, g[e1])
+    acc.index_add_(0, e1, g[e0])
+    ones = torch.ones((e0.shape[0], 1), device=dev, dtype=g.dtype)
+    cnt.index_add_(0, e0, ones)
+    cnt.index_add_(0, e1, ones)
+
+    avg = acc / (cnt + 1e-12)
+    g_new = g + float(alpha) * (avg - g)
+    g.copy_(g_new)
+
+
+def _order_loss_on_vertices(v_def_world: torch.Tensor, roi_v_idx: torch.Tensor, K: torch.Tensor, rot: torch.Tensor, trans: torch.Tensor,
+                           roi_xywh, depth_obs: torch.Tensor, margin: float):
+    """Penalize vertices that go in front of observed depth: z_pred < D_obs + margin."""
+    if roi_v_idx.numel() == 0:
+        return torch.zeros((), device=v_def_world.device)
+
+    rx, ry, rw, rh = [float(x) for x in roi_xywh]
+    H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+
+    v_roi_world = v_def_world[roi_v_idx]
+    v_roi_cam = apply_rigid(v_roi_world, rot, trans)
+    if v_roi_cam.dim() == 3 and v_roi_cam.shape[0] == 1:
+        v_roi_cam = v_roi_cam[0]
+    uv, _ = project_points(v_roi_cam, K)
+    z = v_roi_cam[:, 2]
+
+    u = torch.round(uv[:, 0] - rx).long()
+    v = torch.round(uv[:, 1] - ry).long()
+
+    in_img = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z > 1e-6)
+    if in_img.sum() == 0:
+        return torch.zeros((), device=v_def_world.device)
+
+    D = torch.zeros_like(z)
+    D[in_img] = depth_obs[v[in_img], u[in_img]]
+    valid = in_img & (D > 1e-4)
+    if valid.sum() == 0:
+        return torch.zeros((), device=v_def_world.device)
+
+    viol = (D[valid] + float(margin)) - z[valid]
+    return torch.relu(viol).pow(2).mean()
+
+
+def _anchor_depth_loss(v_def_world: torch.Tensor, roi_v_idx: torch.Tensor, anchor_local_idx: torch.Tensor,
+                       K: torch.Tensor, rot: torch.Tensor, trans: torch.Tensor, roi_xywh, depth_obs: torch.Tensor, win: int):
+    """For each anchor vertex, pick in a (2*win+1)^2 window the depth closest to z_pred; penalize |z_pred - z_target|."""
+    if roi_v_idx.numel() == 0 or anchor_local_idx.numel() == 0:
+        return torch.zeros((), device=v_def_world.device)
+
+    rx, ry, rw, rh = [float(x) for x in roi_xywh]
+    H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+
+    anchors_global = roi_v_idx[anchor_local_idx]
+    v_world = v_def_world[anchors_global]
+    v_cam = apply_rigid(v_world, rot, trans)
+    if v_cam.dim() == 3 and v_cam.shape[0] == 1:
+        v_cam = v_cam[0]
+    uv, _ = project_points(v_cam, K)
+    z = v_cam[:, 2]
+
+    u0 = torch.round(uv[:, 0] - rx).long()
+    v0 = torch.round(uv[:, 1] - ry).long()
+
+    losses = []
+    for i in range(anchors_global.numel()):
+        u = int(u0[i].item())
+        v = int(v0[i].item())
+        zi = z[i]
+
+        if not (0 <= u < W and 0 <= v < H and zi.item() > 1e-6):
+            continue
+
+        x0 = max(0, u - int(win))
+        x1 = min(W, u + int(win) + 1)
+        y0 = max(0, v - int(win))
+        y1 = min(H, v + int(win) + 1)
+
+        patch = depth_obs[y0:y1, x0:x1].reshape(-1)
+        valid = patch > 1e-4
+        if valid.sum().item() == 0:
+            continue
+
+        patchv = patch[valid]
+        # choose closest depth to current z
+        idx = torch.argmin(torch.abs(patchv - zi))
+        zt = patchv[idx]
+        losses.append(torch.abs(zi - zt))
+
+    if len(losses) == 0:
+        return torch.zeros((), device=v_def_world.device)
+    return torch.stack(losses, dim=0).mean()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--mesh_obj", default="IGNORED")
+    ap.add_argument("--stage1_npz", required=True)
+    ap.add_argument("--depth_obs_npy", required=True)
+    ap.add_argument("--out_dir", required=True)
+
+    ap.add_argument("--init_noise_std", type=float, default=0.01)
+    ap.add_argument("--lr", type=float, default=0.005)
+    ap.add_argument("--epochs", type=int, default=200)
+
+    # keep parity with stage3 data term interface
+    ap.add_argument("--ellipsoid_s0", type=float, default=0.01)
+    ap.add_argument("--max_ellipsoids", type=int, default=5000)
+    ap.add_argument("--sigma_z", type=float, default=0.004)
+    ap.add_argument("--sigma_space", type=float, default=0.03)
+    ap.add_argument("--num_pix", type=int, default=204800)
+    ap.add_argument("--num_t", type=int, default=5)
+
+    ap.add_argument("--lambda_disp", type=float, default=10.0)
+    ap.add_argument("--lambda_shape", type=float, default=0.1)
+
+    ap.add_argument("--data_term", choices=["ray", "gmm"], default="gmm")
+    ap.add_argument("--gmm_sigma_start", type=float, default=0.05)
+    ap.add_argument("--gmm_sigma_end", type=float, default=0.005)
+    ap.add_argument("--gmm_center_mode", choices=["faces", "verts"], default="faces")
+    ap.add_argument("--vis_depth_gate", type=float, default=0.0)
+
+    ap.add_argument("--update_rot", action="store_true")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--debug_every", type=int, default=40)
+    ap.add_argument("--debug_dump", action="store_true")
+    ap.add_argument("--no_report_metrics", action="store_true")
+
+    # v2 new terms
+    ap.add_argument("--lambda_inext", type=float, default=0.0)
+    ap.add_argument("--inext_eps_abs", type=float, default=0.002)
+
+    ap.add_argument("--lambda_order", type=float, default=0.0)
+    ap.add_argument("--order_margin", type=float, default=0.0)
+
+    ap.add_argument("--lambda_anchor", type=float, default=0.0)
+    ap.add_argument("--anchor_k", type=int, default=0)
+    ap.add_argument("--anchor_win", type=int, default=5)
+    ap.add_argument("--anchor_warmup", type=int, default=0)
+
+    ap.add_argument("--grad_diff_alpha", type=float, default=0.0)
+    ap.add_argument("--grad_diff_every", type=int, default=1)
+
+    args = ap.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---------- load inputs (same as stage3) ----------
+    stage1 = np.load(args.stage1_npz, allow_pickle=True)
+    v_init = torch.from_numpy(stage1["verts"]).float().to(device)
+    faces_cpu = stage1["faces"].astype(np.int64)
+    faces_gpu = torch.from_numpy(faces_cpu).long().to(device)
+
+    K = torch.from_numpy(stage1["K"]).float().to(device)
+    rot = torch.from_numpy(stage1["rot"]).float().to(device)
+    trans = torch.from_numpy(stage1["trans"]).float().to(device)
+    roi_xywh = stage1["roi_xywh"].astype(np.float32)
+
+    depth_obs = torch.from_numpy(np.load(args.depth_obs_npy)).float().to(device)
+
+    # GT for evaluation only (keep same path logic as stage3)
+    gt_npz = "/home/hsmr/MassageRobot_Project/RobotBridge/output/stage1_gt/stage1_gt.npz"
+    v_gt = None
+    if os.path.exists(gt_npz):
+        gt = np.load(gt_npz, allow_pickle=True)
+        v_gt = torch.from_numpy(gt["verts"]).float().to(device)
+
+    # stage2 skel adapter (for camera-aligned skin)
+    skel = SkelAdapter(device=str(device))
+    skel.load_from_npz(args.stage1_npz)
+
+    # initial noise on ROI vertices will be applied by model parameters (same as stage3)
+    init_noise_std = float(args.init_noise_std)
+
+    # ---------- static visibility selection (same as stage3) ----------
+    roi_v_idx_override = None
+    roi_f_idx_override = None
+    runtime_vis_gate = 0.0
+
+    should_run_static_selection = (args.data_term == "gmm") or (float(args.vis_depth_gate) > 0.0)
+    if should_run_static_selection:
+        selection_gate = float(args.vis_depth_gate) if float(args.vis_depth_gate) > 0.0 else 0.01
+        term_label = args.data_term.upper()
+        print(f"[Stage3V2][{term_label}] Performing STATIC visibility selection (gate={selection_gate:.4f}m)...")
+
+        with torch.no_grad():
+            rx, ry, rw, rh = [float(x) for x in roi_xywh]
+            H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+
+            # vertices
+            v_cam0 = apply_rigid(v_init, rot, trans)
+            uv_v, _ = project_points(v_cam0, K)
+            z_v = v_cam0[:, 2]
+            u_v = torch.round(uv_v[:, 0] - rx).long()
+            v_v = torch.round(uv_v[:, 1] - ry).long()
+            in_frustum_v = (u_v >= 0) & (u_v < W) & (v_v >= 0) & (v_v < H) & (z_v > 1e-6)
+            Dv = torch.zeros_like(z_v)
+            Dv[in_frustum_v] = depth_obs[v_v[in_frustum_v], u_v[in_frustum_v]]
+            mv = in_frustum_v & (Dv > 1e-4) & (torch.abs(z_v - Dv) <= selection_gate)
+            roi_v_idx_override = torch.where(mv)[0].long()
+
+            # faces (ellipsoid centers)
+            tri0 = v_init[faces_gpu]
+            c0_world = tri0.mean(dim=1)
+            c0_cam = apply_rigid(c0_world, rot, trans)
+            uv_c, _ = project_points(c0_cam, K)
+            z_c = c0_cam[:, 2]
+            u_c = torch.round(uv_c[:, 0] - rx).long()
+            v_c = torch.round(uv_c[:, 1] - ry).long()
+            in_frustum_c = (u_c >= 0) & (u_c < W) & (v_c >= 0) & (v_c < H) & (z_c > 1e-6)
+            Dc = torch.zeros_like(z_c)
+            Dc[in_frustum_c] = depth_obs[v_c[in_frustum_c], u_c[in_frustum_c]]
+            mc = in_frustum_c & (Dc > 1e-4) & (torch.abs(z_c - Dc) <= selection_gate)
+            roi_f_idx_override = torch.where(mc)[0].long()
+
+            max_ell = int(args.max_ellipsoids)
+            if roi_f_idx_override.numel() > max_ell:
+                print(f"[Stage3V2][{term_label}] Subsampling ellipsoids {roi_f_idx_override.numel()} -> {max_ell}")
+                sel = torch.randperm(roi_f_idx_override.numel(), device=device)[:max_ell]
+                roi_f_idx_override = roi_f_idx_override[sel]
+
+        runtime_vis_gate = 0.0
+        print(f"[Stage3V2][{term_label}] Fixed Subset: Verts={roi_v_idx_override.numel()}, Faces={roi_f_idx_override.numel()}")
+        print(f"[Stage3V2][{term_label}] Runtime dynamic gate DISABLED (set to 0.0).")
+    else:
+        runtime_vis_gate = float(args.vis_depth_gate)
+        print(f"[Stage3V2][Ray] Runtime dynamic gate: {runtime_vis_gate}")
+
+    # ---------- init model (reuse stage3 adapters) ----------
+    is_gmm_vertex = (args.data_term == "gmm") and (args.gmm_center_mode == "verts")
+    ModelCls = GaussianSkinModelVertexGMM if is_gmm_vertex else GaussianSkinModel
+
+    model = ModelCls(
+        init_vertices=v_init,
+        faces=faces_gpu,
+        K=K,
+        rot=rot,
+        trans=trans,
+        roi_xywh=roi_xywh,
+        roi_v_idx_override=roi_v_idx_override,
+        roi_f_idx_override=roi_f_idx_override,
+        depth_obs=depth_obs if runtime_vis_gate > 0.0 else None,
+        vis_depth_gate=float(runtime_vis_gate),
+        ellipsoid_s0=float(args.ellipsoid_s0),
+        max_ellipsoids=int(args.max_ellipsoids),
+        chunk_k=1024,
+        device=str(device),
+        learn_rot=bool(args.update_rot),
+    ).to(device)
+
+    # v2 new structures: ROI edges + anchor indices (ONLY meaningful for vertex mode)
+    roi_edges_local = None
+    base_edge_len = None
+    anchor_local_idx = None
+
+    if is_gmm_vertex:
+        with torch.no_grad():
+            roi_v = model.roi_v_idx.detach().to(device).long()
+            roi_edges_local = _build_roi_edges_from_faces(faces_cpu, roi_v, v_init.shape[0], device)
+            if roi_edges_local is not None:
+                e0l, e1l = roi_edges_local
+                v0_roi = v_init[roi_v]
+                base_edge_len = torch.norm(v0_roi[e0l] - v0_roi[e1l], dim=1)
+
+            k = int(args.anchor_k)
+            if k > 0 and roi_v.numel() > 0:
+                k = min(k, int(roi_v.numel()))
+                # deterministic anchors: evenly-spaced in ROI index order
+                idx = torch.linspace(0, roi_v.numel() - 1, steps=k, device=device).round().long()
+                anchor_local_idx = torch.unique(idx)
+    else:
+        if float(args.lambda_inext) > 0.0 or float(args.lambda_order) > 0.0 or float(args.lambda_anchor) > 0.0 or float(args.grad_diff_alpha) > 0.0:
+            print("[Stage3V2][WARN] New terms (inext/order/anchor/grad_diff) are only applied when data_term=gmm and gmm_center_mode=verts. They will be skipped.")
+
+    # ---------- output folders (reuse stage3 layout) ----------
+    dir_vis = os.path.join(args.out_dir, "vis_process")
+    dir_vis_3d = os.path.join(args.out_dir, "vis_3d")
+    dir_vis_3d_comp = os.path.join(dir_vis_3d, "composite")
+    os.makedirs(dir_vis, exist_ok=True)
+    os.makedirs(dir_vis_3d, exist_ok=True)
+    os.makedirs(dir_vis_3d_comp, exist_ok=True)
+
+    # depth vis of obs
+    save_depth_vis(depth_obs, os.path.join(dir_vis, "depth_obs.png"))
+
+    # save START visualization
+    try:
+        save_roi_mesh_ellipsoids_ply(v_init.detach(), faces_cpu, model, os.path.join(dir_vis_3d_comp, "roi_START.ply"), which="pred")
+        save_roi_pred_mesh_only_ply(v_init.detach(), faces_cpu, model, os.path.join(dir_vis_3d, "roi_pred_START.ply"), which="pred")
+        save_roi_ellipsoids_only_ply(v_init.detach(), faces_cpu, model, os.path.join(dir_vis_3d, "roi_ell_START.ply"), which="pred")
+    except Exception as e:
+        print(f"[Stage3V2][WARN] START ply save failed: {e}")
+
+    if v_gt is not None:
+        try:
+            save_mesh_only_ply(v_gt.detach(), faces_cpu, os.path.join(dir_vis_3d, "human_GT.ply"))
+        except Exception as e:
+            print(f"[Stage3V2][WARN] GT ply save failed: {e}")
+
+    # init predicted depth (start)
+    with torch.no_grad():
+        v_def0 = model.forward()
+        depth_pred_start = render_gaussian_depth(
+            model.ellipsoid_centers_cam(v_def0),
+            model.ellipsoid_log_scales(),
+            model.ellipsoid_rot_mats_cam(),
+            K,
+            int(depth_obs.shape[1]),
+            int(depth_obs.shape[0]),
+        )
+        save_depth_vis(depth_pred_start, os.path.join(dir_vis, "depth_pred_start.png"))
+
+    # ---------- optimizer ----------
+    optimizer = optim.Adam(model.parameters(), lr=float(args.lr))
+
+    # add initial noise only to displacement params (vertex mode or face mode both have ellipsoid_disp)
+    with torch.no_grad():
+        if hasattr(model, "ellipsoid_disp") and model.ellipsoid_disp is not None:
+            model.ellipsoid_disp.add_(torch.randn_like(model.ellipsoid_disp) * float(init_noise_std))
+
+    # ---------- schedule for sigma (gmm) ----------
+    sigma_start = float(args.gmm_sigma_start)
+    sigma_end = float(args.gmm_sigma_end)
+
+    print(f"[Stage3V2] iters={args.epochs} | lr={args.lr} | data_term={args.data_term} | center_mode={args.gmm_center_mode}")
+    print(f"[Stage3V2] reg: lambda_disp={args.lambda_disp} lambda_shape={args.lambda_shape} | inext={args.lambda_inext} eps={args.inext_eps_abs} | order={args.lambda_order} margin={args.order_margin} | anchor={args.lambda_anchor} k={args.anchor_k} win={args.anchor_win} warmup={args.anchor_warmup} | grad_diff alpha={args.grad_diff_alpha} every={args.grad_diff_every}")
+
+    # ---------- training loop ----------
+    v_def = v_def0
+    for it in range(1, int(args.epochs) + 1):
+        optimizer.zero_grad(set_to_none=True)
+
+        # forward mesh deformation
+        v_def = model.forward()
+
+        # current ellipsoids params
+        centers_cam = model.ellipsoid_centers_cam(v_def)
+        log_scales = model.ellipsoid_log_scales()
+        rot_mats_cam = model.ellipsoid_rot_mats_cam()
+
+        # sigma schedule (only used in GMM)
+        if args.data_term == "gmm":
+            t = (it - 1) / max(1, (int(args.epochs) - 1))
+            sigma_it = float(sigma_start * (1.0 - t) + sigma_end * t)
+        else:
+            sigma_it = 0.0
+
+        # data term
+        if args.data_term == "ray":
+            nll = ray_overlap_nll(
+                centers_cam,
+                log_scales,
+                rot_mats_cam,
+                K,
+                depth_obs,
+                sigma_z=float(args.sigma_z),
+                sigma_space=float(args.sigma_space),
+                num_pix=int(args.num_pix),
+                num_t=int(args.num_t),
+                vis_depth_gate=float(runtime_vis_gate),
+            )
+        else:
+            nll = gmm_surface_nll(
+                centers_cam,
+                log_scales,
+                rot_mats_cam,
+                K,
+                depth_obs,
+                sigma=float(sigma_it),
+                num_pix=int(args.num_pix),
+                max_ell=int(args.max_ellipsoids),
+            )
+
+        # base regularizations (reuse stage3)
+        loss_disp = (model.ellipsoid_disp ** 2).mean()
+        loss_shape = (model.shape_l() ** 2).mean() if hasattr(model, "shape_l") else torch.zeros((), device=device)
+
+        # v2: inext loss
+        loss_inext = torch.zeros((), device=device)
+        if is_gmm_vertex and float(args.lambda_inext) > 0.0 and (roi_edges_local is not None) and (base_edge_len is not None):
+            e0l, e1l = roi_edges_local
+            roi_v = model.roi_v_idx
+            v_roi = v_def[roi_v]
+            cur_len = torch.norm(v_roi[e0l] - v_roi[e1l], dim=1)
+            diff = torch.abs(cur_len - base_edge_len) - float(args.inext_eps_abs)
+            loss_inext = torch.relu(diff).pow(2).mean()
+
+        # v2: order loss
+        loss_order = torch.zeros((), device=device)
+        if is_gmm_vertex and float(args.lambda_order) > 0.0:
+            loss_order = _order_loss_on_vertices(
+                v_def_world=v_def,
+                roi_v_idx=model.roi_v_idx,
+                K=K,
+                rot=rot,
+                trans=trans,
+                roi_xywh=roi_xywh,
+                depth_obs=depth_obs,
+                margin=float(args.order_margin),
+            )
+
+        # v2: anchor loss (warmup only)
+        loss_anchor = torch.zeros((), device=device)
+        if is_gmm_vertex and float(args.lambda_anchor) > 0.0 and (anchor_local_idx is not None) and (it <= int(args.anchor_warmup)):
+            loss_anchor = _anchor_depth_loss(
+                v_def_world=v_def,
+                roi_v_idx=model.roi_v_idx,
+                anchor_local_idx=anchor_local_idx,
+                K=K,
+                rot=rot,
+                trans=trans,
+                roi_xywh=roi_xywh,
+                depth_obs=depth_obs,
+                win=int(args.anchor_win),
+            )
+
+        loss = (
+            nll
+            + float(args.lambda_disp) * loss_disp
+            + float(args.lambda_shape) * loss_shape
+            + float(args.lambda_inext) * loss_inext
+            + float(args.lambda_order) * loss_order
+            + float(args.lambda_anchor) * loss_anchor
+        )
+
+        loss.backward()
+
+        # gradient diffusion (only for vertex mode)
+        if is_gmm_vertex and float(args.grad_diff_alpha) > 0.0 and (roi_edges_local is not None) and (model.ellipsoid_disp.grad is not None):
+            every = max(1, int(args.grad_diff_every))
+            if (it % every) == 0:
+                e0l, e1l = roi_edges_local
+                _grad_diffuse_vertex_grads(model.ellipsoid_disp.grad, e0l, e1l, float(args.grad_diff_alpha))
+
+        optimizer.step()
+
+        # optional debug
+        if args.debug and ((it == 1) or (it % int(args.debug_every) == 0) or (it == args.epochs)):
+            msg = (
+                f"[Stage3V2][{it:03d}/{args.epochs}] L={loss.item():.5f} "
+                f"(NLL={nll.item():.5f}, disp={loss_disp.item():.5f}, shape={loss_shape.item():.5f}, "
+                f"inext={loss_inext.item():.5f}, order={loss_order.item():.5f}, anchor={loss_anchor.item():.5f}) "
+                f"[centers={centers_cam.shape[0]} sigma={sigma_it:.4f}]"
+            )
+            print(msg)
+
+    # =============================
+    # END visualization + metrics
+    # =============================
+    try:
+        save_roi_mesh_ellipsoids_ply(v_def.detach(), faces_cpu, model, os.path.join(dir_vis_3d_comp, "roi_END.ply"), which="pred")
+        save_roi_pred_mesh_only_ply(v_def.detach(), faces_cpu, model, os.path.join(dir_vis_3d, "roi_pred_END.ply"), which="pred")
+        save_roi_ellipsoids_only_ply(v_def.detach(), faces_cpu, model, os.path.join(dir_vis_3d, "roi_ell_END.ply"), which="pred")
+        save_roi_pred_ellipsoids_only_ply(v_def.detach(), faces_cpu, model, os.path.join(dir_vis_3d_comp, "roi_pred_only_END.ply"), which="pred")
+    except Exception as e:
+        print(f"[Stage3V2][WARN] END ply save failed: {e}")
+
+    with torch.no_grad():
+        depth_pred_end = render_gaussian_depth(
+            model.ellipsoid_centers_cam(v_def),
+            model.ellipsoid_log_scales(),
+            model.ellipsoid_rot_mats_cam(),
+            K,
+            int(depth_obs.shape[1]),
+            int(depth_obs.shape[0]),
+        )
+        save_depth_vis(depth_pred_end, os.path.join(dir_vis, "depth_pred_end.png"))
+
+    if not args.no_report_metrics:
+        with torch.no_grad():
+            roi_idx = model.roi_v_idx if hasattr(model, "roi_v_idx") else torch.arange(v_def.shape[0], device=device)
+            start_dev, end_dev = mean_vertex_deviation(v_init, v_def, v_gt, roi_idx)
+        print(f"[Stage3V2][ROIMeanDev] start={start_dev * 100:.4f}cm end={end_dev * 100:.4f}cm")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,703 @@
+import os
+import sys
+import argparse
+import math
+import numpy as np
+import torch
+import torch.optim as optim
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from stage1.camera import apply_rigid, project_points
+from stage1.render_depth import render_gaussian_depth
+from stage2.skel_adapter import SkelAdapter
+from stage2.optim_theta import save_comparison_ply
+
+from utils.vis import save_depth_vis
+from utils.ray_likelihood import ray_overlap_nll
+from utils.gmm_likelihood import gmm_surface_nll
+from utils.ply_vis import (
+    save_roi_mesh_ellipsoids_ply,
+    save_roi_pred_ellipsoids_only_ply,
+    save_mesh_only_ply,
+    save_roi_pred_mesh_only_ply,
+    save_roi_ellipsoids_only_ply,
+)
+from utils.metrics import mean_vertex_deviation
+from utils.vis_roi import save_overlay_ellipsoids_gt_png
+
+from stage3.gaussian_adapter import GaussianSkinModel, GaussianSkinModelVertexGMM
+
+
+def _unique_edges_from_faces(faces: torch.Tensor) -> torch.Tensor:
+    e = torch.cat([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], dim=0)
+    e = torch.sort(e, dim=1).values
+    e = torch.unique(e, dim=0)
+    return e
+
+
+def _vertex_normals_from_faces(V: torch.Tensor, F: torch.Tensor) -> torch.Tensor:
+    v0 = V[F[:, 0]]
+    v1 = V[F[:, 1]]
+    v2 = V[F[:, 2]]
+    fn = torch.cross(v1 - v0, v2 - v0, dim=1)
+    vn = torch.zeros_like(V)
+    vn.index_add_(0, F[:, 0], fn)
+    vn.index_add_(0, F[:, 1], fn)
+    vn.index_add_(0, F[:, 2], fn)
+    vn = vn / (vn.norm(dim=1, keepdim=True) + 1e-12)
+    return vn
+
+
+def _grad_diffuse_inplace(grad: torch.Tensor, edges: torch.Tensor, alpha: float, every: int, it: int):
+    if alpha <= 0.0:
+        return
+    if every <= 0:
+        return
+    if (it % every) != 0:
+        return
+    if grad is None or not isinstance(grad, torch.Tensor) or grad.numel() == 0:
+        return
+    if edges is None or not isinstance(edges, torch.Tensor) or edges.numel() == 0:
+        return
+
+    M = int(grad.shape[0])
+    src = edges[:, 0]
+    dst = edges[:, 1]
+
+    deg = torch.zeros((M,), device=grad.device, dtype=grad.dtype)
+    deg.index_add_(0, src, torch.ones_like(src, dtype=grad.dtype))
+    deg.index_add_(0, dst, torch.ones_like(dst, dtype=grad.dtype))
+
+    neigh_sum = torch.zeros_like(grad)
+    neigh_sum.index_add_(0, src, grad[dst])
+    neigh_sum.index_add_(0, dst, grad[src])
+
+    neigh_mean = neigh_sum / (deg.view(-1, 1) + 1e-12)
+    lap = neigh_mean - grad
+    grad.add_(lap * float(alpha))
+
+
+def _anchor_match_pixel(depth_obs: torch.Tensor, u0: int, v0: int, win: int, z_ref: float):
+    H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+    u0 = int(u0)
+    v0 = int(v0)
+    win = int(max(win, 0))
+
+    u_min = max(u0 - win, 0)
+    u_max = min(u0 + win, W - 1)
+    v_min = max(v0 - win, 0)
+    v_max = min(v0 + win, H - 1)
+
+    patch = depth_obs[v_min:v_max + 1, u_min:u_max + 1]
+    valid = patch > 1e-4
+    if not bool(valid.any().item()):
+        return None
+
+    z_ref_t = torch.tensor(float(z_ref), device=depth_obs.device, dtype=depth_obs.dtype)
+    diff = torch.abs(patch - z_ref_t)
+    diff = torch.where(valid, diff, torch.full_like(diff, 1e9))
+    idx = torch.argmin(diff)
+    hh = int(idx // diff.shape[1])
+    ww = int(idx % diff.shape[1])
+    u = u_min + ww
+    v = v_min + hh
+    z = float(patch[hh, ww].item())
+    return int(u), int(v), z
+
+
+def _backproject(u: torch.Tensor, v: torch.Tensor, z: torch.Tensor, K: torch.Tensor):
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+    x = (u - cx) * z / (fx + 1e-12)
+    y = (v - cy) * z / (fy + 1e-12)
+    return torch.stack([x, y, z], dim=1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--mesh_obj", default="IGNORED")
+    ap.add_argument("--stage1_npz", required=True)
+    ap.add_argument("--depth_obs_npy", required=True)
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--init_noise_std", type=float, default=0.01)
+    ap.add_argument("--lr", type=float, default=0.005)
+    ap.add_argument("--epochs", type=int, default=200)
+
+    ap.add_argument("--ellipsoid_s0", type=float, default=0.01)
+    ap.add_argument("--max_ellipsoids", type=int, default=5000)
+    ap.add_argument("--sigma_z", type=float, default=0.004)
+    ap.add_argument("--sigma_space", type=float, default=0.03)
+    ap.add_argument("--num_pix", type=int, default=204800)
+    ap.add_argument("--num_t", type=int, default=5)
+
+    ap.add_argument("--lambda_disp", type=float, default=10.0)
+    ap.add_argument("--lambda_shape", type=float, default=0.1)
+
+    ap.add_argument("--lambda_tan", type=float, default=0.0)
+    ap.add_argument("--lambda_tan_anchor", type=float, default=0.0)
+
+    ap.add_argument("--no_report_metrics", action="store_true")
+
+    ap.add_argument("--data_term", type=str, default="gmm", choices=["ray", "gmm"])
+    ap.add_argument("--gmm_sigma_start", type=float, default=0.05)
+    ap.add_argument("--gmm_sigma_end", type=float, default=0.005)
+    ap.add_argument("--gmm_center_mode", type=str, default="verts", choices=["faces", "verts"])
+    ap.add_argument("--update_rot", action="store_true")
+
+    ap.add_argument("--vis_depth_gate", type=float, default=0.06)
+
+    # === V2 新增项 ===
+    ap.add_argument("--lambda_inext", type=float, default=0.0)
+    ap.add_argument("--inext_eps_abs", type=float, default=0.002)
+
+    ap.add_argument("--lambda_order", type=float, default=0.0)
+    ap.add_argument("--order_margin", type=float, default=0.0)
+
+    ap.add_argument("--lambda_anchor", type=float, default=0.0)
+    ap.add_argument("--anchor_k", type=int, default=12)
+    ap.add_argument("--anchor_win", type=int, default=5)
+    ap.add_argument("--anchor_warmup", type=int, default=50)
+
+    ap.add_argument("--grad_diff_alpha", type=float, default=0.0)
+    ap.add_argument("--grad_diff_every", type=int, default=1)
+
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--debug_every", type=int, default=40)
+    ap.add_argument("--debug_dump", action="store_true")
+
+    args = ap.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    dir_vis_3d = os.path.join(args.out_dir, "vis_3d")
+    os.makedirs(dir_vis_3d, exist_ok=True)
+    dir_vis_3d_comp = os.path.join(dir_vis_3d, "composite")
+    os.makedirs(dir_vis_3d_comp, exist_ok=True)
+    dir_vis = os.path.join(args.out_dir, "vis_process")
+    os.makedirs(dir_vis, exist_ok=True)
+
+    # 1) Load Stage1 + Depth
+    s1 = np.load(args.stage1_npz)
+    K = torch.from_numpy(s1["K"]).float().to(device)
+    rot = torch.from_numpy(s1["rot"]).float().to(device)
+    trans = torch.from_numpy(s1["trans"]).float().to(device)
+    roi_xywh = s1["roi_xywh"].tolist() if hasattr(s1["roi_xywh"], "tolist") else list(s1["roi_xywh"])
+
+    depth_obs = torch.from_numpy(np.load(args.depth_obs_npy)).float().to(device)
+    roi_h, roi_w = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+    roi_wh = (roi_w, roi_h)
+    save_depth_vis(depth_obs, os.path.join(dir_vis, "depth_obs.png"))
+
+    # 2) Init GT & Mesh (用于评估)
+    GT_NPZ = "/home/hsmr/MassageRobot_Project/RobotBridge/experiments/synthetic_case_001/skeleton/HSMR-ballerina.png.npz"
+    gt = np.load(GT_NPZ, allow_pickle=True)
+    gt_pose = gt["poses"]
+    if gt_pose.shape[1] != 46:
+        gt_pose = gt_pose[:, :46] if gt_pose.shape[1] > 46 else np.pad(gt_pose, ((0, 0), (0, 46 - gt_pose.shape[1])))
+
+    skel = SkelAdapter("female", gt_pose, gt["betas"], init_noise_std=0.0, device=device).to(device)
+    with torch.no_grad():
+        v_gt = skel.forward_vertices().clone()
+        if v_gt.dim() == 3 and v_gt.shape[0] == 1:
+            v_gt = v_gt[0]
+
+    faces_cpu = skel.faces
+    faces_gpu = torch.tensor(skel.faces.astype(np.int32), device=device).long()
+
+    v_init = v_gt.clone()
+    if args.init_noise_std > 0:
+        v_init += torch.randn_like(v_init) * float(args.init_noise_std)
+
+    # 3) 静态筛选（与原 Stage3 保持一致）
+    roi_v_idx_override = None
+    roi_f_idx_override = None
+    runtime_vis_gate = 0.0
+
+    should_run_static_selection = (args.data_term == "gmm") or (float(args.vis_depth_gate) > 0.0)
+    if should_run_static_selection:
+        selection_gate = float(args.vis_depth_gate) if float(args.vis_depth_gate) > 0.0 else 0.01
+        term_label = args.data_term.upper()
+        print(f"[Stage3V2][{term_label}] Performing STATIC visibility selection (gate={selection_gate:.4f}m)...")
+
+        with torch.no_grad():
+            rx, ry, rw, rh = [float(x) for x in roi_xywh]
+            H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+
+            v_cam0 = apply_rigid(v_init, rot, trans)
+            uv_v, _ = project_points(v_cam0, K)
+            z_v = v_cam0[:, 2]
+            u_v = torch.round(uv_v[:, 0] - rx).long()
+            v_v = torch.round(uv_v[:, 1] - ry).long()
+
+            in_frustum_v = (u_v >= 0) & (u_v < W) & (v_v >= 0) & (v_v < H) & (z_v > 1e-6)
+            Dv = torch.zeros_like(z_v)
+            Dv[in_frustum_v] = depth_obs[v_v[in_frustum_v], u_v[in_frustum_v]]
+            mv = in_frustum_v & (Dv > 1e-4) & (torch.abs(z_v - Dv) <= selection_gate)
+            roi_v_idx_override = torch.where(mv)[0].long()
+
+            tri0 = v_init[faces_gpu]
+            c0_world = tri0.mean(dim=1)
+            c0_cam = apply_rigid(c0_world, rot, trans)
+            uv_c, _ = project_points(c0_cam, K)
+            z_c = c0_cam[:, 2]
+            u_c = torch.round(uv_c[:, 0] - rx).long()
+            v_c = torch.round(uv_c[:, 1] - ry).long()
+
+            in_frustum_c = (u_c >= 0) & (u_c < W) & (v_c >= 0) & (v_c < H) & (z_c > 1e-6)
+            Dc = torch.zeros_like(z_c)
+            Dc[in_frustum_c] = depth_obs[v_c[in_frustum_c], u_c[in_frustum_c]]
+            mc = in_frustum_c & (Dc > 1e-4) & (torch.abs(z_c - Dc) <= selection_gate)
+            roi_f_idx_override = torch.where(mc)[0].long()
+
+            max_ell = int(args.max_ellipsoids)
+            if roi_f_idx_override.numel() > max_ell:
+                print(f"[Stage3V2][{term_label}] Subsampling ellipsoids {roi_f_idx_override.numel()} -> {max_ell}")
+                sel = torch.randperm(roi_f_idx_override.numel(), device=device)[:max_ell]
+                roi_f_idx_override = roi_f_idx_override[sel]
+
+        runtime_vis_gate = 0.0
+        print(f"[Stage3V2][{term_label}] Fixed Subset: Verts={roi_v_idx_override.numel()}, Faces={roi_f_idx_override.numel()}")
+        print(f"[Stage3V2][{term_label}] Runtime dynamic gate DISABLED (set to 0.0).")
+
+    # 4) Init Model（V2 默认 verts；仍允许 faces）
+    is_gmm_vertex = (args.data_term == "gmm") and (args.gmm_center_mode == "verts")
+    ModelCls = GaussianSkinModelVertexGMM if is_gmm_vertex else GaussianSkinModel
+
+    model = ModelCls(
+        init_vertices=v_init,
+        faces=faces_gpu,
+        K=K,
+        rot=rot,
+        trans=trans,
+        roi_xywh=roi_xywh,
+        roi_v_idx_override=roi_v_idx_override,
+        roi_f_idx_override=roi_f_idx_override,
+        depth_obs=depth_obs if runtime_vis_gate > 0.0 else None,
+        vis_depth_gate=float(runtime_vis_gate),
+        ellipsoid_s0=float(args.ellipsoid_s0),
+        max_ellipsoids=int(args.max_ellipsoids),
+        chunk_k=1024,
+        device=str(device),
+        learn_rot=bool(args.update_rot),
+    ).to(device)
+
+    # === V2: ROI edges & base lengths（inext + grad diffusion + anchor） ===
+    roi_edges_local = None
+    base_edge_len = None
+    roi_v_idx = model.roi_v_idx
+    nV = int(model.base_verts.shape[0])
+
+    disp_is_roi_vertex = (
+        hasattr(model, "ellipsoid_disp")
+        and isinstance(model.ellipsoid_disp, torch.Tensor)
+        and model.ellipsoid_disp.dim() == 2
+        and int(model.ellipsoid_disp.shape[0]) == int(roi_v_idx.numel())
+    )
+
+    if disp_is_roi_vertex:
+        with torch.no_grad():
+            roi_mask = torch.zeros((nV,), device=device, dtype=torch.bool)
+            roi_mask[roi_v_idx] = True
+            edges_world = _unique_edges_from_faces(faces_gpu)
+            edges_world = edges_world[roi_mask[edges_world[:, 0]] & roi_mask[edges_world[:, 1]]]
+
+            mapping = torch.full((nV,), -1, device=device, dtype=torch.long)
+            mapping[roi_v_idx] = torch.arange(roi_v_idx.numel(), device=device)
+            roi_edges_local = mapping[edges_world]
+
+            if float(args.lambda_inext) > 0.0:
+                V0 = model.base_verts
+                e0 = edges_world[:, 0]
+                e1 = edges_world[:, 1]
+                base_edge_len = torch.norm(V0[e0] - V0[e1], dim=1)
+
+    anchor_local = None
+    if float(args.lambda_anchor) > 0.0 and disp_is_roi_vertex:
+        with torch.no_grad():
+            M = int(roi_v_idx.numel())
+            k = int(max(1, min(int(args.anchor_k), M)))
+            if k == M:
+                anchor_local = torch.arange(M, device=device, dtype=torch.long)
+            else:
+                step = max(1, M // k)
+                idx = torch.arange(0, M, step, device=device, dtype=torch.long)[:k]
+                anchor_local = idx
+
+    tan_edges = None
+    tan_normals = None
+    if disp_is_roi_vertex and float(args.lambda_tan) > 0.0:
+        with torch.no_grad():
+            roi_mask = torch.zeros((nV,), device=device, dtype=torch.bool)
+            roi_mask[roi_v_idx] = True
+            edges_world = _unique_edges_from_faces(faces_gpu)
+            edges_world = edges_world[roi_mask[edges_world[:, 0]] & roi_mask[edges_world[:, 1]]]
+            mapping = torch.full((nV,), -1, device=device, dtype=torch.long)
+            mapping[roi_v_idx] = torch.arange(roi_v_idx.numel(), device=device)
+            tan_edges = mapping[edges_world]
+            tan_normals = _vertex_normals_from_faces(model.base_verts, faces_gpu)[roi_v_idx]
+
+    ell_count = int(model.roi_v_idx.numel()) if is_gmm_vertex else int(model.roi_faces.shape[0])
+
+    optimizer = optim.Adam([
+        {"params": [model.ellipsoid_disp], "lr": float(args.lr)},
+        {"params": [model.ellipsoid_shape_raw], "lr": float(args.lr) * 0.2},
+    ])
+    if bool(args.update_rot):
+        optimizer.add_param_group({"params": [model.ellipsoid_rotvec], "lr": float(args.lr) * 0.1})
+
+    roi_dev_start = float("nan")
+    roi_dev_end = float("nan")
+
+    # ---- START 可视化 ----
+    with torch.no_grad():
+        v_start = model().detach()
+        v_gt_cam = apply_rigid(v_gt, rot, trans)
+        v_start_cam = apply_rigid(v_start, rot, trans)
+
+        save_comparison_ply(
+            v_start_cam.detach().cpu().numpy(),
+            v_gt_cam.detach().cpu().numpy(),
+            faces_cpu,
+            os.path.join(dir_vis_3d_comp, "opt_start.ply"),
+        )
+
+        if not args.no_report_metrics:
+            roi_dev_start = mean_vertex_deviation(v_start_cam, v_gt_cam, idx=model.roi_v_idx).item()
+
+        c_start_cam = model.ellipsoid_centers_cam(v_start)
+        log_s_start = model.ellipsoid_log_scales()
+        rot_mats_start = model.ellipsoid_rot_mats_cam()
+
+        save_roi_mesh_ellipsoids_ply(
+            v_gt=v_gt_cam,
+            v_pred=v_start_cam,
+            faces=faces_gpu,
+            K=K,
+            roi_xywh=roi_xywh,
+            centers_pred=c_start_cam,
+            ellipsoid_log_scales=log_s_start,
+            ellipsoid_rot_mats=rot_mats_start,
+            out_ply=os.path.join(dir_vis_3d_comp, "roi_START.ply"),
+            max_ellipsoids=int(ell_count),
+            ellipsoid_level=1,
+        )
+        save_roi_pred_mesh_only_ply(
+            v_pred=v_start_cam,
+            faces=faces_gpu,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_pred_START.ply"),
+        )
+        save_roi_ellipsoids_only_ply(
+            centers_pred=c_start_cam,
+            ellipsoid_log_scales=log_s_start,
+            ellipsoid_rot_mats=rot_mats_start,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_ell_START.ply"),
+            max_ellipsoids=int(ell_count),
+            ellipsoid_level=1,
+        )
+        save_mesh_only_ply(
+            v=v_gt_cam,
+            faces=faces_gpu,
+            out_ply=os.path.join(dir_vis_3d, "human_GT.ply"),
+            rgb=(0, 0, 255),
+        )
+        save_overlay_ellipsoids_gt_png(
+            v_gt_cam=v_gt_cam,
+            centers_cam=c_start_cam,
+            ellipsoid_log_scales=log_s_start,
+            ellipsoid_rot_mats=rot_mats_start,
+            K=K,
+            roi_xywh=roi_xywh,
+            roi_wh=roi_wh,
+            out_png=os.path.join(dir_vis, "overlay_ell_gt_start.png"),
+            title="Stage3V2 START: ellipsoids + GT",
+            max_gt_points=20000,
+            max_ellipsoids=None,
+            ellipsoid_level=1.0,
+        )
+
+        depth_pred_start = render_gaussian_depth(
+            c_start_cam, K, roi_wh, roi_xywh, radius=0.025, sigma_scale=3.0
+        )
+        save_depth_vis(depth_pred_start, os.path.join(dir_vis, "depth_pred_start.png"))
+
+    print(f"[Stage3V2] iters={int(args.epochs)} | lr={float(args.lr)} | ellipsoids={int(ell_count)} | roi_verts={int(model.roi_v_idx.numel())}")
+    print(f"[Stage3V2] reg: lambda_disp={float(args.lambda_disp)} lambda_shape={float(args.lambda_shape)}")
+    print(f"[Stage3V2] v2: lambda_inext={float(args.lambda_inext)} eps_abs={float(args.inext_eps_abs)} | lambda_order={float(args.lambda_order)} margin={float(args.order_margin)} | lambda_anchor={float(args.lambda_anchor)} warmup={int(args.anchor_warmup)}")
+    print(f"[Stage3V2] diff: alpha={float(args.grad_diff_alpha)} every={int(args.grad_diff_every)} (enabled={disp_is_roi_vertex and float(args.grad_diff_alpha) > 0.0})")
+    print(f"[Stage3V2] data_term={args.data_term}")
+
+    debug_on = bool(args.debug)
+    debug_every = int(args.debug_every)
+    debug_dump = bool(args.debug_dump)
+    debug_dir = os.path.join(args.out_dir, "debug")
+    debug_csv = os.path.join(debug_dir, "debug_stage3v2.csv")
+
+    if debug_on:
+        os.makedirs(debug_dir, exist_ok=True)
+        if not os.path.exists(debug_csv):
+            with open(debug_csv, "w") as f:
+                f.write(",".join([
+                    "it","L","NLL","disp","shape","inext","order","anchor","sigma",
+                    "gdisp_raw","gdisp_clip",
+                ]) + "\n")
+
+    for it in range(1, int(args.epochs) + 1):
+        optimizer.zero_grad()
+
+        v_def = model()
+        centers_cam = model.ellipsoid_centers_cam(v_def)
+        log_scales = model.ellipsoid_log_scales()
+        rot_mats_cam = model.ellipsoid_rot_mats_cam()
+
+        if args.data_term == "ray":
+            loss_nll, stats = ray_overlap_nll(
+                centers_cam=centers_cam,
+                K=K,
+                roi_xywh=roi_xywh,
+                depth_obs=depth_obs,
+                sigma_space=float(args.sigma_space),
+                sigma_z=float(args.sigma_z),
+                num_pix=int(args.num_pix),
+                max_ellipsoids=int(args.max_ellipsoids),
+                ellipsoid_log_scales=log_scales,
+                use_anisotropic=True,
+                learn_ellipsoid=True,
+                num_t=int(args.num_t),
+                vis_depth_gate=float(runtime_vis_gate),
+                ellipsoid_rot_mats=rot_mats_cam,
+            )
+            curr_sigma = 0.0
+        else:
+            if int(args.epochs) <= 1:
+                curr_sigma = float(args.gmm_sigma_end)
+            else:
+                progress = float(it - 1) / float(int(args.epochs) - 1)
+                log_start = math.log(max(float(args.gmm_sigma_start), 1e-6))
+                log_end = math.log(max(float(args.gmm_sigma_end), 1e-6))
+                curr_sigma = math.exp(log_start + (log_end - log_start) * progress)
+
+            loss_nll, stats = gmm_surface_nll(
+                centers_cam=centers_cam,
+                K=K,
+                roi_xywh=roi_xywh,
+                depth_obs=depth_obs,
+                num_pix=int(args.num_pix),
+                max_ellipsoids=int(args.max_ellipsoids),
+                ellipsoid_log_scales=log_scales,
+                use_anisotropic=True,
+                sigma_mult=float(curr_sigma),
+                vis_depth_gate=float(runtime_vis_gate),
+                ellipsoid_rot_mats=rot_mats_cam,
+            )
+
+        loss_disp_reg = (model.ellipsoid_disp ** 2).mean() * float(args.lambda_disp)
+        l = model.shape_l()
+        loss_shape_reg = (l ** 2).mean() * float(args.lambda_shape)
+
+        loss_inext = torch.tensor(0.0, device=loss_nll.device)
+        if float(args.lambda_inext) > 0.0 and disp_is_roi_vertex and roi_edges_local is not None and base_edge_len is not None:
+            e0 = roi_edges_local[:, 0]
+            e1 = roi_edges_local[:, 1]
+            curr_len = torch.norm(v_def[roi_v_idx][e0] - v_def[roi_v_idx][e1], dim=1)
+            diff = torch.abs(curr_len - base_edge_len)
+            viol = torch.relu(diff - float(args.inext_eps_abs))
+            loss_inext = (viol * viol).mean() * float(args.lambda_inext)
+
+        loss_order = torch.tensor(0.0, device=loss_nll.device)
+        if float(args.lambda_order) > 0.0:
+            with torch.no_grad():
+                rx, ry = float(roi_xywh[0]), float(roi_xywh[1])
+                H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+
+            v_cam = apply_rigid(v_def, rot, trans)
+            uv, _ = project_points(v_cam, K)
+            z = v_cam[:, 2]
+            u = torch.round(uv[:, 0] - rx).long()
+            v = torch.round(uv[:, 1] - ry).long()
+            in_img = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z > 1e-6)
+            D = torch.zeros_like(z)
+            D[in_img] = depth_obs[v[in_img], u[in_img]]
+            valid = in_img & (D > 1e-4)
+            viol = torch.relu((D - float(args.order_margin)) - z)
+            viol = torch.where(valid, viol, torch.zeros_like(viol))
+            loss_order = (viol * viol).mean() * float(args.lambda_order)
+
+        loss_anchor = torch.tensor(0.0, device=loss_nll.device)
+        if float(args.lambda_anchor) > 0.0 and disp_is_roi_vertex and anchor_local is not None and int(anchor_local.numel()) > 0:
+            if int(it) <= int(args.anchor_warmup):
+                with torch.no_grad():
+                    rx, ry = float(roi_xywh[0]), float(roi_xywh[1])
+                v_cam = apply_rigid(v_def, rot, trans)
+                uv, _ = project_points(v_cam, K)
+                z = v_cam[:, 2]
+
+                a_global = roi_v_idx[anchor_local]
+                u0 = torch.round(uv[a_global, 0] - rx).long()
+                v0 = torch.round(uv[a_global, 1] - ry).long()
+                z0 = z[a_global]
+
+                targets = []
+                masks = []
+                for j in range(int(a_global.numel())):
+                    ui = int(u0[j].item())
+                    vi = int(v0[j].item())
+                    zi = float(z0[j].item())
+                    got = _anchor_match_pixel(depth_obs, ui, vi, int(args.anchor_win), zi)
+                    if got is None:
+                        masks.append(False)
+                        targets.append((0.0, 0.0, 0.0))
+                    else:
+                        uu, vv, zz = got
+                        uu_full = float(uu + rx)
+                        vv_full = float(vv + ry)
+                        masks.append(True)
+                        targets.append((uu_full, vv_full, float(zz)))
+
+                if any(masks):
+                    m = torch.tensor(masks, device=device, dtype=torch.bool)
+                    t = torch.tensor(targets, device=device, dtype=torch.float32)
+                    uu = t[:, 0]
+                    vv = t[:, 1]
+                    zz = t[:, 2]
+                    p_cam = _backproject(uu, vv, zz, K)
+                    pred = v_cam[a_global]
+                    d = pred - p_cam
+                    loss_anchor = (d[m].pow(2).sum(dim=1)).mean() * float(args.lambda_anchor)
+
+        loss_tan = torch.tensor(0.0, device=loss_nll.device)
+        if tan_edges is not None and float(args.lambda_tan) > 0.0:
+            e0 = tan_edges[:, 0]
+            e1 = tan_edges[:, 1]
+            di = model.ellipsoid_disp[e0]
+            dj = model.ellipsoid_disp[e1]
+            dd = di - dj
+            ni = tan_normals[e0]
+            nj = tan_normals[e1]
+            proj_i = dd - (dd * ni).sum(dim=1, keepdim=True) * ni
+            proj_j = dd - (dd * nj).sum(dim=1, keepdim=True) * nj
+            loss_tan = (proj_i.pow(2).sum(dim=1) + proj_j.pow(2).sum(dim=1)).mean() * float(args.lambda_tan)
+            if float(args.lambda_tan_anchor) > 0.0:
+                dt = model.ellipsoid_disp - (model.ellipsoid_disp * tan_normals).sum(dim=1, keepdim=True) * tan_normals
+                loss_tan = loss_tan + dt.mean(dim=0).pow(2).sum() * float(args.lambda_tan_anchor)
+
+        loss = loss_nll + loss_disp_reg + loss_shape_reg + loss_inext + loss_order + loss_anchor + loss_tan
+
+        loss.backward()
+
+        if disp_is_roi_vertex and (model.ellipsoid_disp.grad is not None) and (roi_edges_local is not None):
+            _grad_diffuse_inplace(
+                model.ellipsoid_disp.grad,
+                roi_edges_local,
+                float(args.grad_diff_alpha),
+                int(args.grad_diff_every),
+                int(it),
+            )
+
+        gdisp_raw = float(model.ellipsoid_disp.grad.norm().item()) if model.ellipsoid_disp.grad is not None else 0.0
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        gdisp_clip = float(model.ellipsoid_disp.grad.norm().item()) if model.ellipsoid_disp.grad is not None else 0.0
+
+        optimizer.step()
+
+        if debug_on and ((it % debug_every == 0) or (it == 1) or (it == int(args.epochs))):
+            with open(debug_csv, "a") as f:
+                f.write(",".join([
+                    str(int(it)),
+                    f"{float(loss.item()):.6f}",
+                    f"{float(loss_nll.item()):.6f}",
+                    f"{float(loss_disp_reg.item()):.6f}",
+                    f"{float(loss_shape_reg.item()):.6f}",
+                    f"{float(loss_inext.item()):.6f}",
+                    f"{float(loss_order.item()):.6f}",
+                    f"{float(loss_anchor.item()):.6f}",
+                    f"{float(curr_sigma):.6f}",
+                    f"{float(gdisp_raw):.6e}",
+                    f"{float(gdisp_clip):.6e}",
+                ]) + "\n")
+
+            print(
+                f"[Stage3V2][{it:03d}/{int(args.epochs)}] "
+                f"L={float(loss.item()):.5f} (NLL={float(loss_nll.item()):.5f}, disp={float(loss_disp_reg.item()):.5f}, "
+                f"shape={float(loss_shape_reg.item()):.5f}, inext={float(loss_inext.item()):.3e}, "
+                f"order={float(loss_order.item()):.3e}, anchor={float(loss_anchor.item()):.3e}) "
+                f"[centers={int(ell_count)} pix={int(args.num_pix)} sigma={float(curr_sigma):.4f}]"
+            )
+
+    # ---- END 可视化 ----
+    with torch.no_grad():
+        v_end = model().detach()
+        v_gt_cam = apply_rigid(v_gt, rot, trans)
+        v_end_cam = apply_rigid(v_end, rot, trans)
+
+        save_comparison_ply(
+            v_end_cam.detach().cpu().numpy(),
+            v_gt_cam.detach().cpu().numpy(),
+            faces_cpu,
+            os.path.join(dir_vis_3d_comp, "opt_end.ply"),
+        )
+
+        if not args.no_report_metrics:
+            roi_dev_end = mean_vertex_deviation(v_end_cam, v_gt_cam, idx=model.roi_v_idx).item()
+
+        c_end_cam = model.ellipsoid_centers_cam(v_end)
+        log_s_end = model.ellipsoid_log_scales()
+        rot_mats_end = model.ellipsoid_rot_mats_cam()
+
+        save_roi_mesh_ellipsoids_ply(
+            v_gt=v_gt_cam,
+            v_pred=v_end_cam,
+            faces=faces_gpu,
+            K=K,
+            roi_xywh=roi_xywh,
+            centers_pred=c_end_cam,
+            ellipsoid_log_scales=log_s_end,
+            ellipsoid_rot_mats=rot_mats_end,
+            out_ply=os.path.join(dir_vis_3d_comp, "roi_END.ply"),
+            max_ellipsoids=int(ell_count),
+            ellipsoid_level=1,
+        )
+        save_roi_pred_mesh_only_ply(
+            v_pred=v_end_cam,
+            faces=faces_gpu,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_pred_END.ply"),
+        )
+        save_roi_ellipsoids_only_ply(
+            centers_pred=c_end_cam,
+            ellipsoid_log_scales=log_s_end,
+            ellipsoid_rot_mats=rot_mats_end,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d, "roi_ell_END.ply"),
+            max_ellipsoids=int(ell_count),
+            ellipsoid_level=1,
+        )
+        save_roi_pred_ellipsoids_only_ply(
+            v_pred=v_end_cam,
+            faces=faces_gpu,
+            K=K,
+            roi_xywh=roi_xywh,
+            out_ply=os.path.join(dir_vis_3d_comp, "roi_pred_only_END.ply"),
+        )
+
+        depth_pred_end = render_gaussian_depth(
+            c_end_cam, K, roi_wh, roi_xywh, radius=0.025, sigma_scale=3.0
+        )
+        save_depth_vis(depth_pred_end, os.path.join(dir_vis, "depth_pred_end.png"))
+
+    print(f"[*] Done. Results -> {args.out_dir}")
+    if not args.no_report_metrics:
+        print(f"[Stage3V2][ROIMeanDev] start={roi_dev_start*100.0:.4f}cm end={roi_dev_end*100.0:.4f}cm")
+
+
+if __name__ == "__main__":
+    main()

@@ -8,235 +8,75 @@ import trimesh
 import datetime
 import subprocess
 
-# 添加项目路径
+from pipeline.config_pipeline import *
+
+# Backward-compatible default (config defines MODE, not DEFAULT_MODE)
+DEFAULT_MODE = MODE
+
 sys.path.append("/home/hsmr/MassageRobot_Project/RobotBridge")
 
-# --- 引入配置 ---
-from pipeline.config_pipeline import MODE as DEFAULT_MODE
-from pipeline.config_pipeline import OUT_ROOT, MESH_OBJ, REAL_DEPTH_OBS_NPY, REAL_STAGE1_NPZ
-from pipeline.config_pipeline import DEPTH_SYN_ROT_GT, DEPTH_SYN_TRANS_GT
-
-# --- 引入 Stage 1 模块 ---
-from stage1.config_stage1 import CFG_STAGE1
-from stage1.camera import build_K, apply_rigid, axis_angle_to_matrix
-from stage1.roi import roi_meta
-from stage1.render_depth import render_gaussian_depth
-from stage1.optim_root import optimize_root
-
-# --- [Stage 2 & Data] 引入参数化模型适配器 (确保同源) ---
-from stage2.skel_adapter import SkelAdapter
-
-# --- 引入可视化工具 ---
-from utils.vis import save_depth_vis
-
-
-def _ensure_dir(p):
-    os.makedirs(p, exist_ok=True)
-    return p
-
 
 # ==========================================
-# 1. 核心算法模块: 数据生成 (Data)
+# 1. 数据生成/加载 (Data Generation & Load)
 # ==========================================
 
-def load_real_data(npy_path, vis_dir):
-    """[模块: Data] 读取真实深度与内参"""
-    print(f"[*] Loading Real Data from: {npy_path}")
-    if not os.path.exists(npy_path):
-        print(f"[Warn] Real data not found at {npy_path}")
-        return None
-
-    data_dir = os.path.dirname(npy_path)
-    meta_path = os.path.join(data_dir, "meta.json")
-    depth_arr = np.load(npy_path)
-
-    K_cfg = CFG_STAGE1['K']
-    roi_cfg = CFG_STAGE1['roi_xywh']
-    if os.path.exists(meta_path):
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
-        K_cfg = meta.get('K', K_cfg)
-        roi_cfg = meta.get('roi_xywh', roi_cfg)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if isinstance(K_cfg, dict):
-        K = build_K(**K_cfg, device=device)
-    else:
-        K = torch.tensor(K_cfg, device=device).float()
-
-    depth_tensor = torch.from_numpy(depth_arr).float().to(device)
-
-    if vis_dir:
-        _ensure_dir(vis_dir)
-        save_depth_vis(depth_tensor, os.path.join(vis_dir, "vis_input_real.png"))
-
-    return {
-        'type': 'real',
-        'depth_obs': depth_tensor,
-        'K': K,
-        'roi_xywh': roi_cfg,
-        'gt_pose': None
-    }
+def _ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
-def gen_synthetic_data(mesh_obj_ignored, out_dir):
+def gen_synthetic_data(mesh_path, out_dir):
     """
-    [模块: Data] 生成仿真深度图 (Ground Truth)
-    核心逻辑: 使用 SkelAdapter 实时生成 Mesh，确保与后续优化目标完全一致。
+    生成合成深度图数据
     """
-    # GT 参数路径
-    GT_NPZ_PATH = "/home/hsmr/MassageRobot_Project/RobotBridge/experiments/synthetic_case_001/skeleton/HSMR-ballerina.png.npz"
-    print(f"[*] Generating Synthetic Data from PARAMS: {GT_NPZ_PATH}")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from pipeline.gen_synthetic_data import gen_synthetic_data_main
     _ensure_dir(out_dir)
+    return gen_synthetic_data_main(mesh_path, out_dir)
 
-    # 1. 加载参数 (Pose & Beta)
-    if not os.path.exists(GT_NPZ_PATH):
-        raise FileNotFoundError(f"GT Params not found: {GT_NPZ_PATH}")
-        
-    gt_data = np.load(GT_NPZ_PATH, allow_pickle=True)
-    gt_pose = gt_data['poses']
-    gt_beta = gt_data['betas']
-    
-    # 维度对齐
-    if gt_pose.shape[1] != 46:
-        new_pose = np.zeros((1, 46), dtype=np.float32)
-        valid_len = min(gt_pose.shape[1], 46)
-        new_pose[:, :valid_len] = gt_pose[:, :valid_len]
-        gt_pose = new_pose
 
-    # 2. 实时生成 Mesh
-    print("    -> Invoking SkelAdapter to generate consistent mesh...")
-    adapter = SkelAdapter('female', gt_pose, gt_beta, init_noise_std=0.0, device=device)
-    with torch.no_grad():
-        verts = adapter.forward_vertices().cpu().numpy()
-        faces = adapter.faces
-
-    # 3. 构建 Trimesh & 采样
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-    print(f"    -> Generated Mesh: {mesh.vertices.shape} vertices")
-    
-    # 高密度采样 (200k点)
-    points_surface, face_idx = trimesh.sample.sample_surface(mesh, 200000)
-    V_dense = torch.from_numpy(points_surface).float().to(device)
-    N_dense = torch.from_numpy(mesh.face_normals[face_idx]).float().to(device)
-
-    # 4. 渲染深度
-    K = build_K(**CFG_STAGE1["K"], device=device)
-    roi_cfg = CFG_STAGE1["roi_xywh"]
-    roi = roi_meta(CFG_STAGE1["img_wh"], roi_cfg)
-
-    rot_gt = torch.tensor(DEPTH_SYN_ROT_GT, device=device).float()
-    trans_gt = torch.tensor(DEPTH_SYN_TRANS_GT, device=device).float()
-
-    with torch.no_grad():
-        Vc = apply_rigid(V_dense, rot_gt, trans_gt)
-        R = axis_angle_to_matrix(rot_gt[None])[0]
-        Nc = N_dense @ R.t()
-        front = (Vc[:, 2] > 1e-6) & ((Nc * Vc).sum(dim=1) < 0.0)
-        Vc = Vc[front]
-
-        depth_obs = render_gaussian_depth(
-            Vc, K, roi['roi_wh'], roi_cfg, radius=0.002
-        )
-        depth_obs[depth_obs > 50] = 0
-
-    # 5. 保存
-    np.save(os.path.join(out_dir, "depth_obs.npy"), depth_obs.cpu().numpy())
-    save_depth_vis(depth_obs, os.path.join(out_dir, "vis_depth_obs.png"))
-
-    meta = {
-        "K": K.detach().cpu().numpy().tolist(),
-        "roi_xywh": list(map(int, roi_cfg)),
-        "source_type": "generated_from_skel_params",
-        "source_npz": GT_NPZ_PATH
-    }
-    with open(os.path.join(out_dir, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-
-    return {
-        'type': 'syn',
-        'depth_obs': depth_obs,
-        'K': K,
-        'roi_xywh': roi_cfg
-    }
+def load_real_data(depth_npy, out_dir):
+    """
+    加载真实深度图数据（如果 out_dir 不为空，则复制保存一份）
+    """
+    from pipeline.load_real_data import load_real_data_main
+    _ensure_dir(out_dir) if out_dir else None
+    return load_real_data_main(depth_npy, out_dir)
 
 
 def generate_gt_init_npz(out_dir):
-    """[辅助] 生成 GT 作为 Stage 1 的替代结果 (force_gt_init)"""
+    """
+    生成“完美 Stage1”初始化结果（以 GT pose / cam 为准）
+    """
+    from pipeline.force_gt_init import force_gt_init_main
     _ensure_dir(out_dir)
-    out_npz = os.path.join(out_dir, "stage1_init_gt.npz")
+    return force_gt_init_main(out_dir)
 
-    rot_val = np.array(DEPTH_SYN_ROT_GT, dtype=np.float32)
-    trans_val = np.array(DEPTH_SYN_TRANS_GT, dtype=np.float32)
 
-    device = torch.device("cpu")
-    roi_xywh = np.array(CFG_STAGE1["roi_xywh"])
-    K_val = build_K(**CFG_STAGE1["K"], device=device).numpy()
-
-    np.savez(
-        out_npz,
-        rot=rot_val,
-        trans=trans_val,
-        K=K_val,
-        roi_xywh=roi_xywh,
-        roi_meta={"roi_xywh": roi_xywh.tolist()}
-    )
-    print(f"[*] Generated GT Init Pose -> {out_npz}")
-    return out_npz
-
+# ==========================================
+# 2. Stage1 / Stage2 / Stage3 调用封装
+# ==========================================
 
 def run_stage1(data_ctx, mesh_obj, out_dir):
-    """[模块: Stage1] 稀疏顶点优化 (Rigid Alignment)"""
-    print(f"[*] Running Stage 1 (Rigid Align) -> {out_dir}")
-    device = data_ctx['depth_obs'].device
+    """
+    调用 stage1.run_stage1
+    """
+    print(f"[*] Running Stage 1 -> {out_dir}")
     _ensure_dir(out_dir)
+    cmd = [
+        sys.executable, "-m", "stage1.run_stage1",
+        "--mesh_obj", mesh_obj,
+        "--data_json", json.dumps(data_ctx),
+        "--out_dir", out_dir
+    ]
+    subprocess.check_call(cmd)
+    return os.path.join(out_dir, "stage1_result.npz")
 
-    from pipeline.config_pipeline import STAGE1_INIT_ROT, STAGE1_INIT_TRANS
-    rot = torch.tensor(STAGE1_INIT_ROT, device=device, requires_grad=True).float()
-    trans = torch.tensor(STAGE1_INIT_TRANS, device=device, requires_grad=True).float()
-
-    # Stage 1 仍使用 OBJ 加载稀疏点
-    mesh = trimesh.load(mesh_obj, process=False)
-    V_sparse = torch.from_numpy(mesh.vertices).float().to(device)
-
-    def render_fn():
-        Vc = apply_rigid(V_sparse, rot, trans)
-        d_pred = render_gaussian_depth(
-            Vc, data_ctx['K'],
-            roi_meta(CFG_STAGE1["img_wh"], data_ctx['roi_xywh'])['roi_wh'],
-            data_ctx['roi_xywh'],
-            radius=0.025
-        )
-        mask = (d_pred < 50) & (data_ctx['depth_obs'] > 0)
-        return d_pred, mask
-
-    optimize_root(
-        render_fn=render_fn,
-        depth_obs=data_ctx['depth_obs'],
-        rotvec=rot,
-        trans=trans,
-        **CFG_STAGE1["optim"]
-    )
-
-    out_npz = os.path.join(out_dir, "stage1_result.npz")
-    np.savez(
-        out_npz,
-        rot=rot.detach().cpu().numpy(),
-        trans=trans.detach().cpu().numpy(),
-        K=data_ctx['K'].detach().cpu().numpy(),
-        roi_xywh=np.array(data_ctx['roi_xywh']),
-    )
-    return out_npz
-
-
-# ==========================================
-# 2. Stage 2 & 3 执行模块 (Subprocess)
-# ==========================================
 
 def run_stage2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0):
-    print(f"[*] Running Stage 2 (Optim Theta) -> {out_dir} [Noise={init_noise_std}]")
+    """
+    调用 stage2.run_stage2
+    """
+    print(f"[*] Running Stage 2 -> {out_dir} [Noise={init_noise_std}]")
     _ensure_dir(out_dir)
     cmd = [
         sys.executable, "-m", "stage2.run_stage2",
@@ -292,15 +132,19 @@ def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
 
 
 def run_stage3v2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
-                 stage3v2_data_term="gmm", stage3v2_gmm_sigma_start=0.05, stage3v2_gmm_sigma_end=0.005,
+                 stage3v2_data_term="gmm",
+                 stage3v2_gmm_sigma_start=0.05, stage3v2_gmm_sigma_end=0.005,
                  stage3v2_gmm_center_mode="verts",
-                 stage3v2_vis_depth_gate=0.06, stage3v2_debug=False, stage3v2_debug_every=40, stage3v2_debug_dump=False, stage3v2_update_rot=False,
+                 stage3v2_vis_depth_gate=0.06,
+                 stage3v2_update_rot=False,
+                 stage3v2_debug=False, stage3v2_debug_every=40, stage3v2_debug_dump=False,
                  stage3v2_lambda_inext=0.0, stage3v2_inext_eps_abs=0.002,
                  stage3v2_lambda_order=0.0, stage3v2_order_margin=0.0,
                  stage3v2_lambda_anchor=0.0, stage3v2_anchor_k=12, stage3v2_anchor_win=5, stage3v2_anchor_warmup=50,
                  stage3v2_grad_diff_alpha=0.0, stage3v2_grad_diff_every=1):
     """
-    调用 stage3.run_stage3_pipeline_v2（新增模块，不影响旧版 stage3）
+    新增 Stage3V2：在不影响旧 Stage3 的前提下，引入结构正则/锚点/顺序/梯度扩散等增强项。
+    调用 stage3.run_stage3_pipeline_v2
     """
     print(f"[*] Running Stage 3V2 (Micro-Skin+) -> {out_dir} [Noise={init_noise_std} Term={stage3v2_data_term}]")
     _ensure_dir(out_dir)
@@ -316,7 +160,6 @@ def run_stage3v2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.
         "--data_term", str(stage3v2_data_term),
         "--gmm_sigma_start", str(stage3v2_gmm_sigma_start),
         "--gmm_sigma_end", str(stage3v2_gmm_sigma_end),
-        "--gmm_center_mode", str(stage3v2_gmm_center_mode),
         "--vis_depth_gate", str(stage3v2_vis_depth_gate),
         "--lambda_inext", str(stage3v2_lambda_inext),
         "--inext_eps_abs", str(stage3v2_inext_eps_abs),
@@ -329,6 +172,8 @@ def run_stage3v2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.
         "--grad_diff_alpha", str(stage3v2_grad_diff_alpha),
         "--grad_diff_every", str(int(stage3v2_grad_diff_every)),
     ]
+    if str(stage3v2_data_term) == "gmm" and str(stage3v2_gmm_center_mode) != "faces":
+        cmd += ["--gmm_center_mode", str(stage3v2_gmm_center_mode)]
     if bool(stage3v2_update_rot):
         cmd += ["--update_rot"]
     if bool(stage3v2_debug):
@@ -338,8 +183,6 @@ def run_stage3v2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.
         print("[Stage3V2][DBG] enabled:", " ".join(cmd))
     subprocess.check_call(cmd)
     return os.path.join(out_dir, "displacement_opt.npy")
-
-
 
 
 # ==========================================
@@ -372,21 +215,20 @@ def main():
     parser.add_argument('--stage3_lambda_tan', type=float, default=0.0)
     parser.add_argument('--stage3_lambda_tan_anchor', type=float, default=0.0)
 
-
-    # Stage3V2 (新增) 控制参数
+    # Stage3V2 (新增，不影响旧 Stage3)
     parser.add_argument('--stage3v2_data_term', type=str, default='gmm', choices=['ray', 'gmm'])
     parser.add_argument('--stage3v2_gmm_sigma_start', type=float, default=0.05)
     parser.add_argument('--stage3v2_gmm_sigma_end', type=float, default=0.005)
     parser.add_argument('--stage3v2_gmm_center_mode', type=str, default='verts', choices=['faces', 'verts'])
     parser.add_argument('--stage3v2_vis_depth_gate', type=float, default=0.06)
+    parser.add_argument('--stage3v2_update_rot', action='store_true')
     parser.add_argument('--stage3v2_debug', action='store_true')
     parser.add_argument('--stage3v2_debug_every', type=int, default=40)
     parser.add_argument('--stage3v2_debug_dump', action='store_true')
-    parser.add_argument('--stage3v2_update_rot', action='store_true')
 
+    # Stage3V2 结构/锚点/顺序/扩散（全部为新增开关）
     parser.add_argument('--stage3v2_lambda_inext', type=float, default=0.0)
     parser.add_argument('--stage3v2_inext_eps_abs', type=float, default=0.002)
-
     parser.add_argument('--stage3v2_lambda_order', type=float, default=0.0)
     parser.add_argument('--stage3v2_order_margin', type=float, default=0.0)
 
@@ -415,6 +257,9 @@ def main():
     elif args.steps == ['data', 'stage1', 'stage2', 'stage3']:
         # 全流程
         prefix = "pipeline"
+    elif args.steps == ['data', 'stage1', 'stage2', 'stage3v2']:
+        # 全流程 (V2)
+        prefix = "pipeline_v2"
     else:
         # 混合步骤
         prefix = "_".join(args.steps)
@@ -499,9 +344,7 @@ def main():
             stage3_lambda_tan_anchor=args.stage3_lambda_tan_anchor
         )
 
-
-
-    # --- [Step 5] Stage 3V2 (新增) ---
+    # --- [Step 4.5] Stage 3V2 ---
     if 'stage3v2' in args.steps:
         if not stage1_npz: raise ValueError("Stage 1 result missing")
         if not depth_obs_path: raise ValueError("Depth obs missing")
@@ -529,6 +372,7 @@ def main():
             stage3v2_grad_diff_alpha=args.stage3v2_grad_diff_alpha,
             stage3v2_grad_diff_every=args.stage3v2_grad_diff_every,
         )
+
 
     print(f"=== Pipeline Finished | Results: {run_dir} ===")
 

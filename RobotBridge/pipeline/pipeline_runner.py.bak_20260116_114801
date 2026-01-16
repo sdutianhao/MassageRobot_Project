@@ -291,57 +291,55 @@ def run_stage3(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
     return os.path.join(out_dir, "displacement_opt.npy")
 
 
+
+
 def run_stage3v2(mesh_obj, stage1_npz, depth_obs_npy, out_dir, init_noise_std=0.0,
-                 stage3v2_data_term="gmm", stage3v2_gmm_sigma_start=0.05, stage3v2_gmm_sigma_end=0.005,
-                 stage3v2_gmm_center_mode="verts",
-                 stage3v2_vis_depth_gate=0.06, stage3v2_debug=False, stage3v2_debug_every=40, stage3v2_debug_dump=False, stage3v2_update_rot=False,
-                 stage3v2_lambda_inext=0.0, stage3v2_inext_eps_abs=0.002,
-                 stage3v2_lambda_order=0.0, stage3v2_order_margin=0.0,
-                 stage3v2_lambda_anchor=0.0, stage3v2_anchor_k=12, stage3v2_anchor_win=5, stage3v2_anchor_warmup=50,
-                 stage3v2_grad_diff_alpha=0.0, stage3v2_grad_diff_every=1):
+               stage3v2_data_term='gmm', stage3v2_gmm_sigma_start=0.05, stage3v2_gmm_sigma_end=0.005,
+               stage3v2_gmm_center_mode='verts',
+               stage3v2_vis_depth_gate=0.06, stage3v2_debug=False, stage3v2_debug_every=40, stage3v2_debug_dump=False, stage3v2_update_rot=False,
+               stage3v2_lambda_inext=0.0, stage3v2_inext_eps_abs=0.002,
+               stage3v2_lambda_order=0.0, stage3v2_order_margin=0.0,
+               stage3v2_lambda_anchor=0.0, stage3v2_anchor_k=12, stage3v2_anchor_win=5, stage3v2_anchor_warmup=50,
+               stage3v2_grad_diff_alpha=0.0, stage3v2_grad_diff_every=1):
     """
-    调用 stage3.run_stage3_pipeline_v2（新增模块，不影响旧版 stage3）
+    调用 stage3.run_stage3_pipeline_v2（新增模块，数据来源与旧 Stage3 完全一致）
     """
     print(f"[*] Running Stage 3V2 (Micro-Skin+) -> {out_dir} [Noise={init_noise_std} Term={stage3v2_data_term}]")
     _ensure_dir(out_dir)
     cmd = [
-        sys.executable, "-m", "stage3.run_stage3_pipeline_v2",
-        "--mesh_obj", mesh_obj,
-        "--stage1_npz", stage1_npz,
-        "--depth_obs_npy", depth_obs_npy,
-        "--out_dir", out_dir,
-        "--init_noise_std", str(init_noise_std),
-        "--lr", "0.005",
-        "--epochs", "200",
-        "--data_term", str(stage3v2_data_term),
-        "--gmm_sigma_start", str(stage3v2_gmm_sigma_start),
-        "--gmm_sigma_end", str(stage3v2_gmm_sigma_end),
-        "--gmm_center_mode", str(stage3v2_gmm_center_mode),
-        "--vis_depth_gate", str(stage3v2_vis_depth_gate),
-        "--lambda_inext", str(stage3v2_lambda_inext),
-        "--inext_eps_abs", str(stage3v2_inext_eps_abs),
-        "--lambda_order", str(stage3v2_lambda_order),
-        "--order_margin", str(stage3v2_order_margin),
-        "--lambda_anchor", str(stage3v2_lambda_anchor),
-        "--anchor_k", str(int(stage3v2_anchor_k)),
-        "--anchor_win", str(int(stage3v2_anchor_win)),
-        "--anchor_warmup", str(int(stage3v2_anchor_warmup)),
-        "--grad_diff_alpha", str(stage3v2_grad_diff_alpha),
-        "--grad_diff_every", str(int(stage3v2_grad_diff_every)),
+        sys.executable, '-m', 'stage3.run_stage3_pipeline_v2',
+        '--mesh_obj', mesh_obj,
+        '--stage1_npz', stage1_npz,
+        '--depth_obs_npy', depth_obs_npy,
+        '--out_dir', out_dir,
+        '--init_noise_std', str(init_noise_std),
+        '--lr', '0.005',
+        '--epochs', '200',
+        '--data_term', str(stage3v2_data_term),
+        '--gmm_sigma_start', str(stage3v2_gmm_sigma_start),
+        '--gmm_sigma_end', str(stage3v2_gmm_sigma_end),
+        '--gmm_center_mode', str(stage3v2_gmm_center_mode),
+        '--vis_depth_gate', str(stage3v2_vis_depth_gate),
+        '--lambda_inext', str(stage3v2_lambda_inext),
+        '--inext_eps_abs', str(stage3v2_inext_eps_abs),
+        '--lambda_order', str(stage3v2_lambda_order),
+        '--order_margin', str(stage3v2_order_margin),
+        '--lambda_anchor', str(stage3v2_lambda_anchor),
+        '--anchor_k', str(int(stage3v2_anchor_k)),
+        '--anchor_win', str(int(stage3v2_anchor_win)),
+        '--anchor_warmup', str(int(stage3v2_anchor_warmup)),
+        '--grad_diff_alpha', str(stage3v2_grad_diff_alpha),
+        '--grad_diff_every', str(int(stage3v2_grad_diff_every)),
     ]
     if bool(stage3v2_update_rot):
-        cmd += ["--update_rot"]
+        cmd += ['--update_rot']
     if bool(stage3v2_debug):
-        cmd += ["--debug", "--debug_every", str(int(stage3v2_debug_every))]
+        cmd += ['--debug', '--debug_every', str(int(stage3v2_debug_every))]
         if bool(stage3v2_debug_dump):
-            cmd += ["--debug_dump"]
-        print("[Stage3V2][DBG] enabled:", " ".join(cmd))
+            cmd += ['--debug_dump']
+        print('[Stage3V2][DBG] enabled:', ' '.join(cmd))
     subprocess.check_call(cmd)
-    return os.path.join(out_dir, "displacement_opt.npy")
-
-
-
-
+    return os.path.join(out_dir, 'displacement_opt.npy')
 # ==========================================
 # 3. 主控流程 (Main Pipeline)
 # ==========================================
@@ -372,31 +370,27 @@ def main():
     parser.add_argument('--stage3_lambda_tan', type=float, default=0.0)
     parser.add_argument('--stage3_lambda_tan_anchor', type=float, default=0.0)
 
-
-    # Stage3V2 (新增) 控制参数
+    # Stage3V2 控制参数（全新模块，不影响旧 Stage3）
     parser.add_argument('--stage3v2_data_term', type=str, default='gmm', choices=['ray', 'gmm'])
     parser.add_argument('--stage3v2_gmm_sigma_start', type=float, default=0.05)
     parser.add_argument('--stage3v2_gmm_sigma_end', type=float, default=0.005)
     parser.add_argument('--stage3v2_gmm_center_mode', type=str, default='verts', choices=['faces', 'verts'])
     parser.add_argument('--stage3v2_vis_depth_gate', type=float, default=0.06)
+    parser.add_argument('--stage3v2_update_rot', action='store_true')
     parser.add_argument('--stage3v2_debug', action='store_true')
     parser.add_argument('--stage3v2_debug_every', type=int, default=40)
     parser.add_argument('--stage3v2_debug_dump', action='store_true')
-    parser.add_argument('--stage3v2_update_rot', action='store_true')
-
     parser.add_argument('--stage3v2_lambda_inext', type=float, default=0.0)
     parser.add_argument('--stage3v2_inext_eps_abs', type=float, default=0.002)
-
     parser.add_argument('--stage3v2_lambda_order', type=float, default=0.0)
     parser.add_argument('--stage3v2_order_margin', type=float, default=0.0)
-
     parser.add_argument('--stage3v2_lambda_anchor', type=float, default=0.0)
     parser.add_argument('--stage3v2_anchor_k', type=int, default=12)
     parser.add_argument('--stage3v2_anchor_win', type=int, default=5)
     parser.add_argument('--stage3v2_anchor_warmup', type=int, default=50)
-
     parser.add_argument('--stage3v2_grad_diff_alpha', type=float, default=0.0)
     parser.add_argument('--stage3v2_grad_diff_every', type=int, default=1)
+
 
     args = parser.parse_args()
 
@@ -500,15 +494,14 @@ def main():
         )
 
 
-
-    # --- [Step 5] Stage 3V2 (新增) ---
+    # --- [Step 5] Stage 3V2 ---
     if 'stage3v2' in args.steps:
-        if not stage1_npz: raise ValueError("Stage 1 result missing")
-        if not depth_obs_path: raise ValueError("Depth obs missing")
+        if not stage1_npz: raise ValueError('Stage 1 result missing')
+        if not depth_obs_path: raise ValueError('Depth obs missing')
 
         noise_vert = 0.04 if args.perturb_vertices else 0.0
         run_stage3v2(
-            MESH_OBJ, stage1_npz, depth_obs_path, os.path.join(run_dir, "stage3v2"), noise_vert,
+            MESH_OBJ, stage1_npz, depth_obs_path, os.path.join(run_dir, 'stage3v2'), noise_vert,
             stage3v2_data_term=args.stage3v2_data_term,
             stage3v2_gmm_sigma_start=args.stage3v2_gmm_sigma_start,
             stage3v2_gmm_sigma_end=args.stage3v2_gmm_sigma_end,
@@ -527,7 +520,7 @@ def main():
             stage3v2_anchor_win=args.stage3v2_anchor_win,
             stage3v2_anchor_warmup=args.stage3v2_anchor_warmup,
             stage3v2_grad_diff_alpha=args.stage3v2_grad_diff_alpha,
-            stage3v2_grad_diff_every=args.stage3v2_grad_diff_every,
+            stage3v2_grad_diff_every=args.stage3v2_grad_diff_every
         )
 
     print(f"=== Pipeline Finished | Results: {run_dir} ===")

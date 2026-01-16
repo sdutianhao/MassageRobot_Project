@@ -1,0 +1,393 @@
+import os
+import sys
+import argparse
+import math
+import numpy as np
+import torch
+import torch.optim as optim
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from stage1.camera import apply_rigid, project_points
+from stage1.render_depth import render_gaussian_depth
+from stage2.skel_adapter import SkelAdapter
+from stage2.optim_theta import save_comparison_ply
+
+from utils.vis import save_depth_vis
+from utils.ray_likelihood import ray_overlap_nll
+from utils.gmm_likelihood import gmm_surface_nll
+from utils.ply_vis import (
+    save_roi_mesh_ellipsoids_ply,
+    save_roi_mesh_ply,
+    save_human_mesh_ply,
+)
+
+from utils.metrics import report_roi_mean_deviation
+
+from stage3.gaussian_adapter import GaussianSkinModel
+
+
+def _ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def _build_default_mesh_from_skel_params(device):
+    """
+    复用 SkelAdapter 生成 mesh (与数据生成一致)
+    """
+    GT_NPZ_PATH = "/home/hsmr/MassageRobot_Project/RobotBridge/experiments/synthetic_case_001/skeleton/HSMR-ballerina.png.npz"
+    if not os.path.exists(GT_NPZ_PATH):
+        raise FileNotFoundError(f"GT Params not found: {GT_NPZ_PATH}")
+
+    gt_data = np.load(GT_NPZ_PATH, allow_pickle=True)
+    gt_pose = gt_data['poses']
+    gt_beta = gt_data['betas']
+
+    if gt_pose.shape[1] != 46:
+        new_pose = np.zeros((1, 46), dtype=np.float32)
+        valid_len = min(gt_pose.shape[1], 46)
+        new_pose[:, :valid_len] = gt_pose[:, :valid_len]
+        gt_pose = new_pose
+
+    adapter = SkelAdapter('female', gt_pose, gt_beta, init_noise_std=0.0, device=device)
+    with torch.no_grad():
+        verts = adapter.forward_vertices().detach()
+        faces = adapter.faces
+    return verts, faces
+
+
+def _get_roi_verts_by_visibility(depth_obs, K, rot, trans, verts, vis_depth_gate):
+    """
+    静态可见性筛选: 投影到深度图，筛选满足 |z_pred - z_obs| <= gate 的顶点
+    """
+    device = verts.device
+    with torch.no_grad():
+        Vc = apply_rigid(verts, rot, trans)
+        uv, z = project_points(Vc, K)
+        H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+
+        u = uv[:, 0].round().long()
+        v = uv[:, 1].round().long()
+
+        inimg = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z > 1e-6)
+        idx = torch.where(inimg)[0]
+
+        if idx.numel() == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+
+        u0 = u[idx]
+        v0 = v[idx]
+        z_obs = depth_obs[v0, u0]
+        z_pred = z[idx]
+
+        valid = (z_obs > 0)
+        idx2 = idx[valid]
+        if idx2.numel() == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+
+        if vis_depth_gate is None or float(vis_depth_gate) <= 0:
+            return idx2
+
+        u1 = u[idx2]
+        v1 = v[idx2]
+        z_obs2 = depth_obs[v1, u1]
+        z_pred2 = z[idx2]
+        gate = float(vis_depth_gate)
+        ok = (torch.abs(z_pred2 - z_obs2) <= gate)
+        return idx2[ok]
+
+
+def _choose_anchor_indices(roi_idx, K):
+    """
+    在 ROI 顶点里选择 K 个 anchor。此处采用等间隔抽样（确定性），避免引入随机性。
+    """
+    if roi_idx.numel() == 0 or int(K) <= 0:
+        return roi_idx[:0]
+    K = int(min(int(K), int(roi_idx.numel())))
+    if K <= 0:
+        return roi_idx[:0]
+    step = max(1, int(math.floor(float(roi_idx.numel()) / float(K))))
+    sel = roi_idx[::step][:K]
+    return sel
+
+
+def _local_window_best_pixel(depth_obs, u0, v0, win):
+    """
+    在 (u0,v0) 周围 win x win 窗口内，找一个“最像表面”的像素:
+    - 只考虑 depth>0
+    - 取深度最小者（更靠前的表面），作为粗鲁棒选择
+    返回 (u*, v*, z*)
+    """
+    H, W = int(depth_obs.shape[0]), int(depth_obs.shape[1])
+    w = int(win)
+    r = w // 2
+
+    umin = max(0, int(u0) - r)
+    umax = min(W - 1, int(u0) + r)
+    vmin = max(0, int(v0) - r)
+    vmax = min(H - 1, int(v0) + r)
+
+    patch = depth_obs[vmin:vmax+1, umin:umax+1]
+    mask = (patch > 0)
+    if not torch.any(mask):
+        return None
+
+    z = patch.clone()
+    z[~mask] = 1e9
+    flat = torch.argmin(z.reshape(-1))
+    hh = int(flat // z.shape[1])
+    ww = int(flat % z.shape[1])
+    u = umin + ww
+    v = vmin + hh
+    zval = depth_obs[v, u]
+    return (u, v, zval)
+
+
+def main():
+    ap = argparse.ArgumentParser("Stage3V2 (Micro-Skin+)")
+    ap.add_argument("--mesh_obj", default="IGNORED")
+    ap.add_argument("--stage1_npz", required=True)
+    ap.add_argument("--depth_obs_npy", required=True)
+    ap.add_argument("--out_dir", required=True)
+
+    ap.add_argument("--init_noise_std", type=float, default=0.01)
+    ap.add_argument("--lr", type=float, default=0.005)
+    ap.add_argument("--epochs", type=int, default=200)
+
+    # 模型内部可用参数（保留兼容）
+    ap.add_argument("--ellipsoid_s0", type=float, default=0.01)
+    ap.add_argument("--max_ellipsoids", type=int, default=5000)
+
+    # ray 数据项相关
+    ap.add_argument("--sigma_z", type=float, default=0.004)
+    ap.add_argument("--sigma_space", type=float, default=0.03)
+    ap.add_argument("--num_pix", type=int, default=204800)
+    ap.add_argument("--num_t", type=int, default=5)
+
+    # 原有正则项（保留兼容）
+    ap.add_argument("--lambda_disp", type=float, default=10.0)
+    ap.add_argument("--lambda_shape", type=float, default=0.1)
+    ap.add_argument("--lambda_tan", type=float, default=0.0)
+    ap.add_argument("--lambda_tan_anchor", type=float, default=0.0)
+
+    ap.add_argument("--no_report_metrics", action="store_true")
+
+    # 数据项选择
+    ap.add_argument("--data_term", type=str, default="gmm", choices=["ray", "gmm"])
+    ap.add_argument("--gmm_sigma_start", type=float, default=0.05)
+    ap.add_argument("--gmm_sigma_end", type=float, default=0.005)
+    ap.add_argument("--gmm_center_mode", type=str, default="verts", choices=["faces", "verts"])
+
+    ap.add_argument("--update_rot", action="store_true")
+    ap.add_argument("--vis_depth_gate", type=float, default=0.06)
+
+    # 新增: inext / order / anchor / grad diffusion
+    ap.add_argument("--lambda_inext", type=float, default=0.0)
+    ap.add_argument("--inext_eps_abs", type=float, default=0.002)
+
+    ap.add_argument("--lambda_order", type=float, default=0.0)
+    ap.add_argument("--order_margin", type=float, default=0.0)
+
+    ap.add_argument("--lambda_anchor", type=float, default=0.0)
+    ap.add_argument("--anchor_k", type=int, default=12)
+    ap.add_argument("--anchor_win", type=int, default=5)
+    ap.add_argument("--anchor_warmup", type=int, default=50)
+
+    ap.add_argument("--grad_diff_alpha", type=float, default=0.0)
+    ap.add_argument("--grad_diff_every", type=int, default=1)
+
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--debug_every", type=int, default=40)
+    ap.add_argument("--debug_dump", action="store_true")
+
+    args = ap.parse_args()
+
+    out_dir = _ensure_dir(args.out_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    depth_obs = torch.from_numpy(np.load(args.depth_obs_npy)).float().to(device)
+    save_depth_vis(depth_obs, os.path.join(out_dir, "vis_process", "depth_obs.png"))
+
+    s1 = np.load(args.stage1_npz, allow_pickle=True)
+    K = torch.tensor(s1["K"], device=device).float()
+    rot = torch.tensor(s1["rot"], device=device).float()
+    trans = torch.tensor(s1["trans"], device=device).float()
+
+    verts, faces = _build_default_mesh_from_skel_params(device)
+
+    # ROI 筛选（静态可见性）
+    roi_idx = _get_roi_verts_by_visibility(depth_obs, K, rot, trans, verts, args.vis_depth_gate)
+    print(f"[Stage3V2] ROI verts selected: {int(roi_idx.numel())}")
+
+    # 选 anchor
+    anchor_idx = _choose_anchor_indices(roi_idx, args.anchor_k)
+
+    # 初始化皮肤模型
+    model = GaussianSkinModel(
+        verts=verts,
+        faces=faces,
+        roi_vert_idx=roi_idx,
+        init_noise_std=float(args.init_noise_std),
+        device=device,
+        gmm_center_mode=str(args.gmm_center_mode),
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=float(args.lr))
+
+    # 可视化起点
+    save_roi_mesh_ply(verts, faces, roi_idx, os.path.join(out_dir, "vis_3d", "composite", "roi_START.ply"))
+    save_roi_mesh_ply(model.verts_pred.detach(), faces, roi_idx, os.path.join(out_dir, "vis_3d", "roi_pred_START.ply"))
+    save_roi_mesh_ellipsoids_ply(model, os.path.join(out_dir, "vis_3d", "roi_ell_START.ply"))
+    save_human_mesh_ply(verts, faces, os.path.join(out_dir, "vis_3d", "human_GT.ply"))
+
+    with torch.no_grad():
+        depth_pred0 = render_gaussian_depth(
+            apply_rigid(model.verts_pred, rot, trans),
+            K, (int(depth_obs.shape[1]), int(depth_obs.shape[0])),
+            [0, 0, int(depth_obs.shape[1]), int(depth_obs.shape[0])],
+            radius=0.002
+        )
+        save_depth_vis(depth_pred0, os.path.join(out_dir, "vis_process", "depth_pred_start.png"))
+
+    # 记录初始（用于 order / inext）
+    base_verts = model.verts_pred.detach().clone()
+
+    # order: 初始深度顺序（anchor 上）
+    with torch.no_grad():
+        Vc0 = apply_rigid(base_verts, rot, trans)
+        uv0, z0 = project_points(Vc0, K)
+        u0 = uv0[:, 0].round().long().clamp(0, int(depth_obs.shape[1]) - 1)
+        v0 = uv0[:, 1].round().long().clamp(0, int(depth_obs.shape[0]) - 1)
+        z_cam0 = z0
+        z_anchor0 = z_cam0[anchor_idx] if anchor_idx.numel() > 0 else z_cam0[:0]
+
+    # 训练
+    for it in range(1, int(args.epochs) + 1):
+        optimizer.zero_grad(set_to_none=True)
+
+        # 渲染/likelihood
+        if str(args.data_term) == "ray":
+            nll, stats = ray_overlap_nll(
+                model=model,
+                depth_obs=depth_obs,
+                K=K,
+                rot=rot,
+                trans=trans,
+                sigma_z=float(args.sigma_z),
+                sigma_space=float(args.sigma_space),
+                num_pix=int(args.num_pix),
+                num_t=int(args.num_t),
+                debug=bool(args.debug),
+            )
+        else:
+            nll, stats = gmm_surface_nll(
+                model=model,
+                depth_obs=depth_obs,
+                K=K,
+                rot=rot,
+                trans=trans,
+                sigma_start=float(args.gmm_sigma_start),
+                sigma_end=float(args.gmm_sigma_end),
+                it=it,
+                it_max=int(args.epochs),
+                num_pix=int(args.num_pix),
+                max_ell=int(args.max_ellipsoids),
+                debug=bool(args.debug),
+            )
+
+        # 原有正则（disp/shape/tan）
+        loss_disp = model.reg_disp() * float(args.lambda_disp)
+        loss_shape = model.reg_shape() * float(args.lambda_shape)
+        loss_tan = model.reg_tan() * float(args.lambda_tan)
+        loss_tan_anchor = model.reg_tan_anchor(anchor_idx) * float(args.lambda_tan_anchor)
+
+        # 新增：inext（基于 anchor 的局部边长近似；实现为 anchor 点到 base 的位移阈值）
+        # 这里不引入网格边集，避免改旧结构；先用“位移幅度阈值”作为近似 inext 约束（保证可跑）
+        if float(args.lambda_inext) > 0.0:
+            disp = (model.verts_pred - base_verts).norm(dim=1)
+            eps = float(args.inext_eps_abs)
+            loss_inext = torch.relu(disp - eps).pow(2).mean() * float(args.lambda_inext)
+        else:
+            loss_inext = torch.zeros([], device=device)
+
+        # 新增：order（anchor 的相对深度顺序不反转）
+        if float(args.lambda_order) > 0.0 and anchor_idx.numel() >= 2:
+            Vc = apply_rigid(model.verts_pred, rot, trans)
+            uv, z_cam = project_points(Vc, K)
+            z_anchor = z_cam[anchor_idx]
+
+            dz0 = z_anchor0[1:] - z_anchor0[:-1]
+            dz = z_anchor[1:] - z_anchor[:-1]
+            sign0 = torch.sign(dz0)
+            margin = float(args.order_margin)
+            loss_order = torch.relu(margin - sign0 * dz).pow(2).mean() * float(args.lambda_order)
+        else:
+            loss_order = torch.zeros([], device=device)
+
+        # 新增：anchor（warmup 内启用，投影窗口最小深度像素作为目标）
+        if float(args.lambda_anchor) > 0.0 and anchor_idx.numel() > 0 and it <= int(args.anchor_warmup):
+            with torch.no_grad():
+                VcA = apply_rigid(model.verts_pred, rot, trans)
+                uvA, zA = project_points(VcA, K)
+                uA = uvA[:, 0].round().long()
+                vA = uvA[:, 1].round().long()
+
+            loss_anchor = torch.zeros([], device=device)
+            cnt = 0
+            for idx in anchor_idx.tolist():
+                u0i = int(uA[idx].item())
+                v0i = int(vA[idx].item())
+                best = _local_window_best_pixel(depth_obs, u0i, v0i, int(args.anchor_win))
+                if best is None:
+                    continue
+                _, _, zt = best
+                loss_anchor = loss_anchor + (zA[idx] - zt).pow(2)
+                cnt += 1
+            if cnt > 0:
+                loss_anchor = (loss_anchor / float(cnt)) * float(args.lambda_anchor)
+        else:
+            loss_anchor = torch.zeros([], device=device)
+
+        # 总损失
+        L = nll + loss_disp + loss_shape + loss_tan + loss_tan_anchor + loss_inext + loss_order + loss_anchor
+        L.backward()
+
+        # 新增：梯度扩散（仅对 disp 参数；每 grad_diff_every 步做一次）
+        if float(args.grad_diff_alpha) > 0.0 and (it % int(args.grad_diff_every) == 0):
+            if hasattr(model, "ellipsoid_disp") and model.ellipsoid_disp.grad is not None:
+                g = model.ellipsoid_disp.grad
+                alpha = float(args.grad_diff_alpha)
+                # 简单邻域平滑：用均值滤波近似扩散（避免引入拓扑矩阵）
+                model.ellipsoid_disp.grad = (1.0 - alpha) * g + alpha * g.mean(dim=0, keepdim=True)
+
+        optimizer.step()
+
+        if bool(args.update_rot):
+            # v2 内不更新 rot/trans（保持与旧版一致的外部姿态）；只保留参数入口做兼容
+            pass
+
+        if (it == 1) or (it % int(args.debug_every) == 0) or (it == int(args.epochs)):
+            print(f"[Stage3V2][{it:03d}/{int(args.epochs)}] L={float(L.item()):.5f} (NLL={float(nll.item()):.5f}, disp={float(loss_disp.item()):.5f}, shape={float(loss_shape.item()):.5f}, tan={float((loss_tan+loss_tan_anchor).item()):.5e}, inext={float(loss_inext.item()):.5f}, order={float(loss_order.item()):.5f}, anchor={float(loss_anchor.item()):.5f})")
+
+    # 可视化终点
+    save_roi_mesh_ply(verts, faces, roi_idx, os.path.join(out_dir, "vis_3d", "composite", "roi_END.ply"))
+    save_roi_mesh_ply(model.verts_pred.detach(), faces, roi_idx, os.path.join(out_dir, "vis_3d", "roi_pred_END.ply"))
+    save_roi_mesh_ellipsoids_ply(model, os.path.join(out_dir, "vis_3d", "roi_ell_END.ply"))
+
+    with torch.no_grad():
+        depth_pred1 = render_gaussian_depth(
+            apply_rigid(model.verts_pred, rot, trans),
+            K, (int(depth_obs.shape[1]), int(depth_obs.shape[0])),
+            [0, 0, int(depth_obs.shape[1]), int(depth_obs.shape[0])],
+            radius=0.002
+        )
+        save_depth_vis(depth_pred1, os.path.join(out_dir, "vis_process", "depth_pred_end.png"))
+
+    if not bool(args.no_report_metrics):
+        roi_dev_start, roi_dev_end = report_roi_mean_deviation(model, verts, roi_idx)
+        print(f"[Stage3V2][ROIMeanDev] start={roi_dev_start*100.0:.4f}cm end={roi_dev_end*100.0:.4f}cm")
+
+
+if __name__ == "__main__":
+    main()
